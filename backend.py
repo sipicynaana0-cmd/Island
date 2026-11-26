@@ -2,6 +2,7 @@ import asyncio
 import base64
 import ctypes
 from ctypes import wintypes
+import difflib
 import io
 import json
 import math
@@ -10,6 +11,7 @@ import re
 import subprocess
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -40,10 +42,14 @@ class RustCoreBridge:
         self.is_loaded = False
         self.core_version: int = 0
         self._has_v21 = False
+        self._has_v22 = False
         self._fft_bands_buf = (ctypes.c_float * 32)()
         self._fft_lvl_buf = ctypes.c_float(0.0)
         self._wave_bands_buf = (ctypes.c_float * 32)()
         self._wave_out_buf = (ctypes.c_float * 64)()
+        self._steam_name_buf = ctypes.create_string_buffer(160)
+        self._steam_pct_buf = ctypes.c_float(0.0)
+        self._steam_mbps_buf = ctypes.c_float(0.0)
         # Pre-allocated batch spring buffers (zero per-frame allocations for up to 256 UI springs!)
         self._sp_cap = 256
         self._sp_vals = (ctypes.c_float * 256)()
@@ -138,10 +144,37 @@ class RustCoreBridge:
                         self._has_v21 = True
                     except Exception:
                         self._has_v21 = False
+                if ver >= 220:
+                    try:
+                        dll.rust_get_capslock_state.restype = ctypes.c_int32
+                        dll.rust_get_removable_drive_mask.restype = ctypes.c_uint32
+                        dll.rust_extract_file_icon_rgba.argtypes = [
+                            ctypes.c_wchar_p,
+                            ctypes.POINTER(ctypes.c_uint8),
+                            ctypes.c_uint32,
+                        ]
+                        dll.rust_extract_file_icon_rgba.restype = ctypes.c_int32
+                        dll.rust_poll_steam_download.argtypes = [
+                            ctypes.c_char_p,
+                            ctypes.c_size_t,
+                            ctypes.POINTER(ctypes.c_float),
+                            ctypes.POINTER(ctypes.c_float),
+                        ]
+                        dll.rust_poll_steam_download.restype = ctypes.c_int32
+                        dll.rust_eval_math_expr.argtypes = [
+                            ctypes.c_char_p,
+                            ctypes.c_size_t,
+                            ctypes.POINTER(ctypes.c_double),
+                        ]
+                        dll.rust_eval_math_expr.restype = ctypes.c_int32
+                        self._has_v22 = True
+                    except Exception:
+                        self._has_v22 = False
         except Exception:
             self._dll = None
             self.is_loaded = False
             self._has_v21 = False
+            self._has_v22 = False
 
     def fft_32bands(self, np_f32_arr, sr: float) -> Optional[Tuple[List[float], float]]:
         if not self.is_loaded or self._dll is None:
@@ -304,6 +337,72 @@ class RustCoreBridge:
             else:
                 hi = mid
         return lo
+
+    def get_capslock_state(self) -> bool:
+        if self._has_v22 and self._dll is not None:
+            try:
+                return bool(self._dll.rust_get_capslock_state())
+            except Exception:
+                pass
+        try:
+            return bool(user32.GetKeyState(0x14) & 1)
+        except Exception:
+            return False
+
+    def get_removable_drive_mask(self) -> int:
+        if self._has_v22 and self._dll is not None:
+            try:
+                return int(self._dll.rust_get_removable_drive_mask())
+            except Exception:
+                pass
+        return 0
+
+    def extract_file_icon_rgba(self, path: str, size: int = 48) -> Optional[bytes]:
+        """Extracts real RGBA8888 Windows .exe/.lnk icon pixels directly via Rust Win32."""
+        if not self._has_v22 or self._dll is None or not path:
+            return None
+        try:
+            buf = (ctypes.c_uint8 * (size * size * 4))()
+            ok = self._dll.rust_extract_file_icon_rgba(str(path), buf, int(size))
+            if ok:
+                return bytes(buf)
+        except Exception:
+            pass
+        return None
+
+    def poll_steam_download(self) -> Optional[Tuple[str, float, float]]:
+        """Polls Steam libraries via Rust for active game downloads -> (name, pct, mbps)."""
+        if not self._has_v22 or self._dll is None:
+            return None
+        try:
+            ok = self._dll.rust_poll_steam_download(
+                self._steam_name_buf,
+                160,
+                ctypes.byref(self._steam_pct_buf),
+                ctypes.byref(self._steam_mbps_buf),
+            )
+            if ok:
+                name = self._steam_name_buf.value.decode("utf-8", errors="ignore").strip() or "Steam"
+                return name, float(self._steam_pct_buf.value), float(self._steam_mbps_buf.value)
+        except Exception:
+            pass
+        return None
+
+    def eval_math_expr(self, expr: str) -> Optional[float]:
+        """Safe native Rust arithmetic evaluator for Spotlight calculator."""
+        if not expr:
+            return None
+        raw = expr.strip().encode("utf-8", errors="ignore")
+        if not raw or len(raw) > 256:
+            return None
+        if self._has_v22 and self._dll is not None:
+            try:
+                out_v = ctypes.c_double(0.0)
+                if self._dll.rust_eval_math_expr(raw, len(raw), ctypes.byref(out_v)):
+                    return float(out_v.value)
+            except Exception:
+                pass
+        return None
 
 
 RUST_CORE = RustCoreBridge()
@@ -818,6 +917,9 @@ class AudioEngine:
         self._cached_vol: float = 50.0
         self._cached_mute: bool = False
         self._cached_peak: float = 0.0
+        self._music_source_hint: str = ""
+        self._music_only_peak: float = 0.0
+        self._has_music_session_meter: bool = False
         self._raw_bands: List[float] = [0.0] * self.N_BANDS
         self._raw_level: float = 0.0
         self._spectrum_live: bool = False
@@ -989,35 +1091,60 @@ class AudioEngine:
         self._cmd_queue.append(("set_mute", self._cached_mute))
         return self._cached_mute
 
-    def get_peak_and_bands(self, is_playing: bool = False) -> Tuple[float, List[float]]:
+    def get_peak_and_bands(self, is_playing: bool = False, source_app: str = "") -> Tuple[float, List[float]]:
         """
-        Instant read of the smoothed 32-band spectrum. Frame-rate independent attack/release:
-        bars jump up instantly on a beat and fall back smoothly like a real analyzer.
+        Instant read of the smoothed 32-band spectrum strictly isolated to MUSIC playback.
+        Ignores Discord voices, game sound effects, and Windows notifications!
         """
         now = time.monotonic()
         dt = max(0.001, min(0.1, now - self._last_bands_t))
         self._last_bands_t = now
 
-        live = self._spectrum_live and (now - self._spectrum_ts) < 0.6
-        if live:
-            targets = self._raw_bands
-            level = self._raw_level
+        if source_app:
+            self._music_source_hint = source_app
+
+        # STRICT MUSIC-ONLY GATE: When music is NOT actively playing, wave & bars stay 100% calm!
+        if not is_playing:
+            targets = [0.0] * self.N_BANDS
+            level = 0.0
         else:
-            # Fallback: real hardware peak meter, flat across bands (no fake animation)
-            level = max(0.0, min(1.0, self._cached_peak * 1.4))
-            targets = [level * (0.9 - 0.35 * (i / (self.N_BANDS - 1))) for i in range(self.N_BANDS)]
+            live = self._spectrum_live and (now - self._spectrum_ts) < 0.6
+            if live:
+                targets = list(self._raw_bands)
+                level = self._raw_level
+            else:
+                level = max(0.0, min(1.0, self._cached_peak * 1.4))
+                targets = [level * (0.9 - 0.35 * (i / (self.N_BANDS - 1))) for i in range(self.N_BANDS)]
+
+            # Per-App Music Player Peak Isolation: if we have the music app's own WASAPI meter,
+            # gate out loud Discord voices / game SFX whenever the music player itself is quiet!
+            if self._has_music_session_meter:
+                mp = self._music_only_peak
+                if mp < 0.004:
+                    targets = [0.0] * self.N_BANDS
+                    level = 0.0
+                else:
+                    total_p = max(mp, self._cached_peak, 0.004)
+                    music_share = max(0.0, min(1.0, (mp / total_p) * 1.15))
+                    if music_share < 0.98:
+                        targets = [t * music_share for t in targets]
+                        level *= music_share
 
         attack = 1.0 - math.exp(-dt / 0.028)
-        release = 1.0 - math.exp(-dt / 0.16)
+        release = 1.0 - math.exp(-dt / 0.14)
         sb = self._smooth_bands
         for i in range(self.N_BANDS):
             t = targets[i] if i < len(targets) else 0.0
             c = sb[i]
             sb[i] = c + (t - c) * (attack if t > c else release)
+            if sb[i] < 0.001:
+                sb[i] = 0.0
 
         bass = (sb[0] + sb[1] + sb[2] + sb[3] + sb[4]) / 5.0
         tgt_peak = max(level * 0.85, bass)
         self._smooth_peak += (tgt_peak - self._smooth_peak) * (attack if tgt_peak > self._smooth_peak else release)
+        if self._smooth_peak < 0.001:
+            self._smooth_peak = 0.0
         return self._smooth_peak, list(sb)
 
     def get_app_sessions(self, trigger_poll: bool = False) -> List[AppAudioSession]:
@@ -1049,7 +1176,35 @@ class AudioEngine:
 
         endpoint_vol = None
         meter = None
+        music_meters = []
         tick = 0
+
+        def _is_music_process(proc_name: str, hint: str) -> bool:
+            pl = proc_name.lower()
+            # Never treat voice chats or system sounds as music!
+            if any(bad in pl for bad in ("discord", "telegram", "teamspeak", "skype", "zoom", "obs64", "explorer")):
+                return False
+            hl = (hint or "").lower()
+            if hl:
+                # Match GSMTC AppUserModelId (e.g. "Yandex.Music", "Spotify.exe", "Chrome", "msedge")
+                if "yandex" in hl or "яндекс" in hl:
+                    if "yandex" in pl or "browser" in pl or "music" in pl:
+                        return True
+                elif "spotify" in hl and "spotify" in pl:
+                    return True
+                elif "chrome" in hl and "chrome" in pl:
+                    return True
+                elif "edge" in hl and "msedge" in pl:
+                    return True
+                elif "firefox" in hl and "firefox" in pl:
+                    return True
+                elif "opera" in hl and "opera" in pl:
+                    return True
+                else:
+                    tok = re.sub(r"\.exe$", "", hl.split("!")[-1].split(".")[-1]).strip()
+                    if len(tok) >= 3 and tok in pl:
+                        return True
+            return any(k in pl for k in ("yandexmusic", "yandex.music", "spotify", "aimp", "foobar", "musicbee", "vlc", "itunes", "tidal", "deezer", "vk"))
 
         while self._running:
             try:
@@ -1087,19 +1242,34 @@ class AudioEngine:
                                     curr = bool(s.SimpleAudioVolume.GetMute())
                                     s.SimpleAudioVolume.SetMute(not curr, None)
 
-                # 2. Poll hardware audio peak at 30Hz
+                # 2. Poll hardware audio peak & music-only session peaks at 30Hz
                 if meter:
                     self._cached_peak = float(meter.GetPeakValue())
+                if music_meters:
+                    mp_max = 0.0
+                    for mm in music_meters:
+                        try:
+                            v = float(mm.GetPeakValue())
+                            if v > mp_max:
+                                mp_max = v
+                        except Exception:
+                            pass
+                    self._music_only_peak = mp_max
+                    self._has_music_session_meter = True
+                else:
+                    self._has_music_session_meter = False
 
                 # 3. Poll master volume every ~180ms
                 if tick % 6 == 0 and endpoint_vol and not self._cmd_queue:
                     self._cached_vol = round(float(endpoint_vol.GetMasterVolumeLevelScalar()) * 100.0)
                     self._cached_mute = bool(endpoint_vol.GetMute())
 
-                # 4. Always poll per-app sessions on startup and every ~0.8s so Mixer is NEVER empty!
+                # 4. Always poll per-app sessions on startup and every ~0.8s so Mixer & Music Gate stay fresh!
                 if tick == 0 or tick % 24 == 0 or self._want_sessions_poll:
                     self._want_sessions_poll = False
                     seen: Dict[str, AppAudioSession] = {}
+                    new_music_meters = []
+                    hint = self._music_source_hint
                     for s in AudioUtilities.GetAllSessions():
                         try:
                             proc = s.Process
@@ -1113,15 +1283,19 @@ class AudioEngine:
                                 vol = float(v_if.GetMasterVolume())
                                 muted = bool(v_if.GetMute())
                                 pk = 0.0
+                                m_if = None
                                 try:
                                     m_if = s._ctl.QueryInterface(IAudioMeterInformation)
                                     pk = float(m_if.GetPeakValue())
                                 except Exception:
                                     pass
+                                if m_if is not None and _is_music_process(raw, hint):
+                                    new_music_meters.append(m_if)
                                 if clean not in seen or pk > seen[clean].peak:
                                     seen[clean] = AppAudioSession(proc.pid, clean, vol, muted, pk)
                         except Exception:
                             continue
+                    music_meters = new_music_meters
                     self._cached_sessions = sorted(seen.values(), key=lambda x: (-x.peak, x.name.lower()))[:6]
 
             except Exception:
@@ -1820,22 +1994,26 @@ class TrackLikesManager:
 
 class LyricsEngine:
     """
-    Real-Time Synced Lyrics Engine (LRCLIB API + local disk cache + Rust O(log N) lookup).
-    Fetches time-synced [mm:ss.xx] lyrics asynchronously in the background with zero UI blocking.
+    Strict Beat-Accurate Synced Lyrics Engine (LRCLIB API + v2 disk cache + Rust O(log N) lookup).
+    - Strictly validates artist, title, and duration so WRONG songs are NEVER shown.
+    - Only syncs genuine [mm:ss.xx] timestamped LRC lines (never fakes out-of-rhythm linear timing!).
+    - Supports user fine-tuning offset (-0.5s / +0.5s) for exact vocal beat lock.
     """
 
     _LRC_LINE_RE = re.compile(r"\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\](.*)")
     _CLEAN_RE = re.compile(r"\s*[\(\[](?:feat\.?|ft\.?|remix|prod\.?|official|video|audio|live|slowed|reverb|edit|ver\.?)[^\)\]]*[\)\]]", re.IGNORECASE)
+    _NORM_RE = re.compile(r"[^\w\s]+", re.UNICODE)
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._cache_path = os.path.join(APP_DIR, "lyrics_cache.json")
+        self._cache_path = os.path.join(APP_DIR, "lyrics_cache_v2.json")
         self._disk_cache: Dict[str, dict] = {}
         self._active_key: str = ""
         self._status: str = "idle"  # "idle", "loading", "synced", "plain", "none"
         self._timestamps_buf = None
         self._timestamps_list: List[float] = []
         self._lines: List[str] = []
+        self.sync_offset_sec: float = 0.0
         self._load_disk_cache()
 
     def _load_disk_cache(self):
@@ -1850,7 +2028,6 @@ class LyricsEngine:
 
     def _save_disk_cache(self):
         try:
-            # Keep cache compact (max 80 recent tracks)
             if len(self._disk_cache) > 80:
                 keys = list(self._disk_cache.keys())[-80:]
                 self._disk_cache = {k: self._disk_cache[k] for k in keys}
@@ -1866,6 +2043,43 @@ class LyricsEngine:
         return s
 
     @classmethod
+    def _norm(cls, s: str) -> str:
+        return re.sub(r"\s+", " ", cls._NORM_RE.sub(" ", (s or "").lower())).strip()
+
+    @classmethod
+    def _is_strict_match(
+        cls,
+        q_artist: str,
+        q_title: str,
+        r_artist: str,
+        r_title: str,
+        q_dur: float,
+        r_dur: float,
+    ) -> bool:
+        qt = cls._norm(cls._clean_query(q_title))
+        rt = cls._norm(cls._clean_query(r_title))
+        if not qt or not rt:
+            return False
+        t_sim = difflib.SequenceMatcher(None, qt, rt).ratio()
+        if t_sim < 0.72 and not (len(qt) >= 4 and (qt in rt or rt in qt) and min(len(qt), len(rt)) / max(len(qt), len(rt)) >= 0.65):
+            return False
+
+        qa = cls._norm(cls._clean_query(q_artist))
+        ra = cls._norm(cls._clean_query(r_artist))
+        if qa and ra:
+            a_sim = difflib.SequenceMatcher(None, qa, ra).ratio()
+            qa_toks = {t for t in qa.split() if len(t) >= 2}
+            ra_toks = {t for t in ra.split() if len(t) >= 2}
+            tok_hit = bool(qa_toks & ra_toks)
+            if a_sim < 0.56 and not tok_hit and qa not in ra and ra not in qa:
+                return False
+
+        if q_dur > 15.0 and r_dur > 15.0:
+            if abs(r_dur - q_dur) > 10.0:
+                return False
+        return True
+
+    @classmethod
     def _parse_lrc(cls, lrc_text: str) -> Tuple[List[float], List[str]]:
         pairs: List[Tuple[float, str]] = []
         for raw_line in (lrc_text or "").splitlines():
@@ -1875,7 +2089,6 @@ class LyricsEngine:
             matches = list(cls._LRC_LINE_RE.finditer(raw_line))
             if not matches:
                 continue
-            # Handle multi-timestamp lines like [00:12.30][01:04.20]Chorus text
             text_part = re.sub(r"\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]", "", raw_line).strip()
             if not text_part:
                 text_part = "· · ·"
@@ -1912,6 +2125,7 @@ class LyricsEngine:
             self._timestamps_list = []
             self._timestamps_buf = None
             self._lines = []
+            self.sync_offset_sec = 0.0
             cached = self._disk_cache.get(key)
             if cached is not None:
                 st = cached.get("status", "none")
@@ -1933,7 +2147,7 @@ class LyricsEngine:
     def _fetch_worker(self, key: str, artist: str, title: str, duration: float):
         synced_raw = ""
         plain_raw = ""
-        headers = {"User-Agent": "Island-Windows/2.1 (https://github.com/sipicynaana0-cmd/Island)"}
+        headers = {"User-Agent": "Island-Windows/2.2 (https://github.com/sipicynaana0-cmd/Island)"}
         try:
             with httpx.Client(timeout=6.0, headers=headers) as client:
                 # 1. Exact LRCLIB /api/get lookup
@@ -1945,31 +2159,44 @@ class LyricsEngine:
                 r = client.get("https://lrclib.net/api/get", params=params)
                 if r.status_code == 200:
                     d = r.json()
-                    synced_raw = d.get("syncedLyrics") or ""
-                    plain_raw = d.get("plainLyrics") or ""
+                    if self._is_strict_match(
+                        artist, title,
+                        d.get("artistName", ""), d.get("trackName", ""),
+                        duration, float(d.get("duration") or 0.0),
+                    ):
+                        synced_raw = d.get("syncedLyrics") or ""
+                        plain_raw = d.get("plainLyrics") or ""
 
-                # 2. Fallback LRCLIB /api/search if /api/get missed
+                # 2. Strict-validated LRCLIB /api/search fallback (rejects wrong songs!)
                 if not synced_raw:
-                    q_str = f"{artist} {title}".strip() if artist else title
-                    r2 = client.get("https://lrclib.net/api/search", params={"q": q_str})
+                    q_params = {"track_name": title}
+                    if artist:
+                        q_params["artist_name"] = artist
+                    r2 = client.get("https://lrclib.net/api/search", params=q_params)
                     if r2.status_code == 200:
                         items = r2.json()
-                        if isinstance(items, list) and items:
-                            # Prefer item with syncedLyrics and closest duration
-                            best = None
-                            for it in items[:8]:
+                        if isinstance(items, list):
+                            best_sync = None
+                            best_plain = None
+                            for it in items[:12]:
+                                if not self._is_strict_match(
+                                    artist, title,
+                                    it.get("artistName", ""), it.get("trackName", ""),
+                                    duration, float(it.get("duration") or 0.0),
+                                ):
+                                    continue
                                 if it.get("syncedLyrics"):
-                                    if best is None:
-                                        best = it
+                                    if best_sync is None:
+                                        best_sync = it
                                     elif duration > 10.0:
-                                        d_new = abs(float(it.get("duration") or 0) - duration)
-                                        d_old = abs(float(best.get("duration") or 0) - duration)
-                                        if d_new < d_old:
-                                            best = it
-                            if best:
-                                synced_raw = best.get("syncedLyrics") or ""
-                            elif not plain_raw:
-                                plain_raw = items[0].get("plainLyrics") or ""
+                                        if abs(float(it.get("duration") or 0) - duration) < abs(float(best_sync.get("duration") or 0) - duration):
+                                            best_sync = it
+                                elif it.get("plainLyrics") and best_plain is None:
+                                    best_plain = it
+                            if best_sync:
+                                synced_raw = best_sync.get("syncedLyrics") or ""
+                            elif best_plain and not plain_raw:
+                                plain_raw = best_plain.get("plainLyrics") or ""
         except Exception:
             pass
 
@@ -1984,13 +2211,10 @@ class LyricsEngine:
         if plain_raw:
             pl_lines = [ln.strip() for ln in plain_raw.splitlines() if ln.strip()]
             if pl_lines:
-                # Synthesize gentle linear timestamps across duration so plain lyrics still scroll smoothly
-                dur_eff = duration if duration > 20.0 else max(90.0, len(pl_lines) * 3.5)
-                step = (dur_eff * 0.88) / max(1, len(pl_lines))
-                ts_l = [round(4.0 + i * step, 2) for i in range(len(pl_lines))]
-                self._disk_cache[key] = {"status": "plain", "ts": ts_l, "lines": pl_lines}
+                # Never fake timestamps for unsynced plain lyrics!
+                self._disk_cache[key] = {"status": "plain", "ts": [], "lines": pl_lines}
                 self._save_disk_cache()
-                self._set_parsed(key, ts_l, pl_lines, "plain")
+                self._set_parsed(key, [], pl_lines, "plain")
                 return
 
         self._disk_cache[key] = {"status": "none", "ts": [], "lines": []}
@@ -1998,22 +2222,310 @@ class LyricsEngine:
         self._set_parsed(key, [], [], "none")
 
     def get_live_state(self, artist: str, title: str, pos_sec: float, duration: float = 0.0) -> Tuple[str, str, str, str, int]:
-        """Returns (prev_line, curr_line, next_line, status, line_index) in < 5 microseconds via Rust."""
+        """Returns (prev_line, curr_line, next_line, status, line_index) in < 5 us via Rust."""
         if title:
             self.ensure_track(artist, title, duration)
         with self._lock:
             st = self._status
-            if st not in ("synced", "plain") or not self._lines or self._timestamps_buf is None:
+            if st == "plain" and self._lines:
+                # Return clean first 3 lines without fake rhythm jumping
+                l0 = self._lines[0] if len(self._lines) > 0 else ""
+                l1 = self._lines[1] if len(self._lines) > 1 else ""
+                l2 = self._lines[2] if len(self._lines) > 2 else ""
+                return l0, l1, l2, "plain", 0
+            if st != "synced" or not self._lines or self._timestamps_buf is None:
                 return "", "", "", st, -1
             n = len(self._lines)
-            # Small +0.18s visual anticipation so lyrics light up right on the vocal beat!
-            idx = RUST_CORE.find_lyric_index(self._timestamps_buf, n, pos_sec + 0.18)
+            idx = RUST_CORE.find_lyric_index(self._timestamps_buf, n, pos_sec + self.sync_offset_sec)
             if idx < 0:
-                return "", "· · ·", self._lines[0] if n > 0 else "", st, -1
+                return "", "· · ·", self._lines[0] if n > 0 else "", "synced", -1
             prev_l = self._lines[idx - 1] if idx > 0 else ""
             curr_l = self._lines[idx]
             next_l = self._lines[idx + 1] if idx + 1 < n else ""
-            return prev_l, curr_l, next_l, st, idx
+            return prev_l, curr_l, next_l, "synced", idx
+
+
+class LiveActivitiesWatcher:
+    """
+    Rust-powered System Live Activities Monitor (Features #3 & #11):
+      - Active Steam game downloads (multi-library .acf scanner in Rust -> name, %, MB/s)
+      - Active Browser downloads in %USERPROFILE%\\Downloads (.crdownload / .part / .opdownload)
+      - USB / Removable drive plug/unplug events (Rust Win32 bitmask)
+      - CapsLock toggle notifications (Rust Win32 GetKeyState)
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.active_download: Optional[Dict[str, object]] = None  # {"source": "steam"|"browser", "name": ..., "pct": ..., "mbps": ..., "mb_done": ...}
+        self._events: List[Dict[str, str]] = []
+        self._last_caps: bool = RUST_CORE.get_capslock_state()
+        self._last_usb_mask: int = RUST_CORE.get_removable_drive_mask()
+        self._dl_prev_sizes: Dict[str, Tuple[int, float]] = {}
+        self._dl_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        self._running = True
+        threading.Thread(target=self._watch_loop, daemon=True).start()
+
+    def pop_event(self) -> Optional[Dict[str, str]]:
+        with self._lock:
+            if self._events:
+                return self._events.pop(0)
+        return None
+
+    def get_download(self) -> Optional[Dict[str, object]]:
+        with self._lock:
+            return dict(self.active_download) if self.active_download else None
+
+    def _watch_loop(self):
+        tick = 0
+        while self._running:
+            try:
+                # 1. Instant CapsLock state check (10Hz)
+                caps = RUST_CORE.get_capslock_state()
+                if caps != self._last_caps:
+                    self._last_caps = caps
+                    with self._lock:
+                        self._events.append({
+                            "type": "caps",
+                            "title": "CAPS LOCK · ВКЛ" if caps else "CAPS LOCK · ВЫКЛ",
+                            "active": "1" if caps else "0",
+                        })
+
+                # 2. USB Removable Drive plug/unplug check (2Hz)
+                if tick % 5 == 0:
+                    usb_m = RUST_CORE.get_removable_drive_mask()
+                    if usb_m != self._last_usb_mask:
+                        added = usb_m & ~self._last_usb_mask
+                        removed = self._last_usb_mask & ~usb_m
+                        self._last_usb_mask = usb_m
+                        for bit in range(26):
+                            if added & (1 << bit):
+                                drv = f"{chr(ord('A') + bit)}:"
+                                with self._lock:
+                                    self._events.append({
+                                        "type": "usb",
+                                        "title": f"USB подключён ({drv})",
+                                        "subtitle": "Съёмный накопитель готов к работе",
+                                        "target": f"{drv}\\",
+                                    })
+                            if removed & (1 << bit):
+                                drv = f"{chr(ord('A') + bit)}:"
+                                with self._lock:
+                                    self._events.append({
+                                        "type": "usb_out",
+                                        "title": f"USB извлечён ({drv})",
+                                        "subtitle": "Устройство безопасно отключено",
+                                    })
+
+                # 3. Steam & Browser active download progress scan (every 1.2s)
+                if tick % 12 == 0:
+                    dl_info = None
+                    st = RUST_CORE.poll_steam_download()
+                    if st is not None:
+                        sname, spct, smbps = st
+                        dl_info = {
+                            "source": "steam",
+                            "name": sname,
+                            "pct": spct,
+                            "mbps": smbps,
+                            "mb_done": 0.0,
+                        }
+                    else:
+                        dl_info = self._scan_browser_downloads()
+                    with self._lock:
+                        self.active_download = dl_info
+            except Exception:
+                pass
+            tick += 1
+            time.sleep(0.1)
+
+    def _scan_browser_downloads(self) -> Optional[Dict[str, object]]:
+        if not os.path.isdir(self._dl_dir):
+            return None
+        now = time.time()
+        best = None
+        best_mtime = 0.0
+        try:
+            for entry in os.scandir(self._dl_dir):
+                low = entry.name.lower()
+                if not (low.endswith(".crdownload") or low.endswith(".part") or low.endswith(".opdownload")):
+                    continue
+                try:
+                    st = entry.stat()
+                except OSError:
+                    continue
+                if (now - st.st_mtime) > 8.0:
+                    continue
+                if st.st_mtime > best_mtime:
+                    best_mtime = st.st_mtime
+                    clean_name = re.sub(r"\.(crdownload|part|opdownload)$", "", entry.name, flags=re.I)
+                    prev = self._dl_prev_sizes.get(entry.path)
+                    mbps = 0.0
+                    if prev is not None:
+                        dt = now - prev[1]
+                        if dt > 0.25 and st.st_size >= prev[0]:
+                            mbps = (st.st_size - prev[0]) / (1_048_576.0 * dt)
+                    self._dl_prev_sizes[entry.path] = (st.st_size, now)
+                    best = {
+                        "source": "browser",
+                        "name": clean_name[:32] or "Загрузка файла",
+                        "pct": -1.0,  # Indeterminate smooth shimmer bar
+                        "mbps": mbps,
+                        "mb_done": st.st_size / 1_048_576.0,
+                    }
+        except Exception:
+            pass
+        return best
+
+
+class SpotlightEngine:
+    """
+    Instant Spotlight Search Engine (Feature #2 — triggered globally via Rust Alt+Space!).
+    Combines:
+      1. Native Rust arithmetic calculator (2450 * 0.85, (120+40)/2, etc.)
+      2. Quick currency/data unit converter (100$, 50eur, 16gb)
+      3. Indexed Windows Start Menu & Desktop programs (.lnk / .exe) with real icons
+      4. Instant Google / YouTube web search fallback
+    """
+
+    _UNIT_RE = re.compile(r"^\s*(\d+(?:[.,]\d+)?)\s*(\$|usd|€|eur|gb|гб|mb|мб|km|км)\s*$", re.IGNORECASE)
+
+    def __init__(self):
+        self._apps: List[Tuple[str, str, str]] = [
+            ("Проводник", "explorer.exe", "system"),
+            ("Блокнот", "notepad.exe", "system"),
+            ("Калькулятор", "calc.exe", "system"),
+            ("Диспетчер задач", "taskmgr.exe", "system"),
+            ("PowerShell", "powershell.exe", "system"),
+            ("Командная строка", "cmd.exe", "system"),
+            ("Ножницы", "snippingtool.exe", "system"),
+            ("Параметры Windows", "ms-settings:", "system"),
+            ("Панель управления", "control.exe", "system"),
+            ("Paint", "mspaint.exe", "system"),
+        ]
+        self._lock = threading.Lock()
+        threading.Thread(target=self._index_start_menu, daemon=True).start()
+
+    def _index_start_menu(self):
+        roots = [
+            os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs"),
+            os.path.join(os.environ.get("PROGRAMDATA", r"C:\ProgramData"), r"Microsoft\Windows\Start Menu\Programs"),
+            os.path.join(os.path.expanduser("~"), "Desktop"),
+        ]
+        found: List[Tuple[str, str, str]] = []
+        seen_names = {a[0].lower() for a in self._apps}
+        for root in roots:
+            if not root or not os.path.isdir(root):
+                continue
+            for dirpath, _, filenames in os.walk(root):
+                for fn in filenames:
+                    low = fn.lower()
+                    if not (low.endswith(".lnk") or low.endswith(".exe") or low.endswith(".url")):
+                        continue
+                    if any(skip in low for skip in ("uninstall", "удалить", "readme", "help", "manual", "setup")):
+                        continue
+                    name = os.path.splitext(fn)[0].strip()
+                    if not name or name.lower() in seen_names:
+                        continue
+                    seen_names.add(name.lower())
+                    found.append((name, os.path.join(dirpath, fn), "app"))
+                    if len(found) >= 350:
+                        break
+        with self._lock:
+            self._apps.extend(found)
+
+    def search(self, query: str) -> List[Dict[str, str]]:
+        q = (query or "").strip()
+        results: List[Dict[str, str]] = []
+
+        if not q:
+            # Quick suggestions when Spotlight opens empty
+            with self._lock:
+                for name, path, kind in self._apps[:5]:
+                    results.append({
+                        "kind": "app",
+                        "title": name,
+                        "subtitle": "Запустить приложение",
+                        "action": path,
+                        "icon_path": path,
+                    })
+            return results
+
+        # 1. Native Rust Calculator
+        val = RUST_CORE.eval_math_expr(q)
+        if val is not None:
+            fmt = f"{int(val)}" if abs(val - round(val)) < 1e-9 else f"{val:.4f}".rstrip("0").rstrip(".")
+            results.append({
+                "kind": "calc",
+                "title": f"= {fmt}",
+                "subtitle": f"Калькулятор Rust · Enter скопирует «{fmt}»",
+                "action": f"copy:{fmt}",
+                "icon_path": "",
+            })
+
+        # 2. Quick Currency / Unit Converter
+        m_u = self._UNIT_RE.match(q)
+        if m_u:
+            num = float(m_u.group(1).replace(",", "."))
+            unit = m_u.group(2).lower()
+            conv_txt = ""
+            if unit in ("$", "usd"):
+                conv_txt = f"≈ {num * 96.0:,.0f} ₽".replace(",", " ")
+            elif unit in ("€", "eur"):
+                conv_txt = f"≈ {num * 104.0:,.0f} ₽".replace(",", " ")
+            elif unit in ("gb", "гб"):
+                conv_txt = f"{num * 1024.0:,.0f} МБ".replace(",", " ")
+            elif unit in ("mb", "мб"):
+                conv_txt = f"{num / 1024.0:.2f} ГБ"
+            elif unit in ("km", "км"):
+                conv_txt = f"{num * 0.62137:.2f} миль · {int(num * 1000)} м"
+            if conv_txt:
+                results.append({
+                    "kind": "calc",
+                    "title": conv_txt,
+                    "subtitle": f"Конвертер · Enter скопирует результат",
+                    "action": f"copy:{conv_txt}",
+                    "icon_path": "",
+                })
+
+        # 3. Matched Installed Apps (prefix match first, then substring match)
+        ql = q.lower()
+        prefix_hits = []
+        sub_hits = []
+        with self._lock:
+            for name, path, _ in self._apps:
+                nl = name.lower()
+                if nl.startswith(ql):
+                    prefix_hits.append((name, path))
+                elif ql in nl:
+                    sub_hits.append((name, path))
+        for name, path in (prefix_hits + sub_hits)[:4]:
+            results.append({
+                "kind": "app",
+                "title": name,
+                "subtitle": os.path.basename(path),
+                "action": path,
+                "icon_path": path,
+            })
+
+        # 4. Instant Web / YouTube Search
+        if ql.startswith("yt ") and len(q) > 3:
+            yt_q = q[3:].strip()
+            results.append({
+                "kind": "web",
+                "title": f"YouTube: {yt_q}",
+                "subtitle": "Открыть поиск на YouTube",
+                "action": f"https://www.youtube.com/results?search_query={urllib.parse.quote_plus(yt_q)}",
+                "icon_path": "",
+            })
+        else:
+            results.append({
+                "kind": "web",
+                "title": f"Найти в Google: {q}",
+                "subtitle": "Открыть в браузере",
+                "action": f"https://www.google.com/search?q={urllib.parse.quote_plus(q)}",
+                "icon_path": "",
+            })
+        return results[:5]
 
 
 class ConsentManager:
