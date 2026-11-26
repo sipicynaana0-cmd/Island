@@ -1,6 +1,6 @@
-# Island v2.2 — Dynamic Island для Windows (Rust Core + PyQt6)
+# Island v2.3 — Dynamic Island для Windows (Rust Core + PyQt6)
 
-Ультра-оптимизированный виджет **Dynamic Island** для Windows в стиле чистого OLED-чёрного (`#000000`) с нативным **Rust-ядром (`island_core.dll` v2.2)**, поиском Spotlight, живыми событиями Steam/USB/CapsLock, реальными иконками программ и строгой изоляцией визуализации только на музыку.
+Ультра-оптимизированный виджет **Dynamic Island** для Windows в строгом стиле чистого OLED-чёрного (`#000000`) с нативным **Rust-ядром (`island_core.dll` v2.3)**, поиском Spotlight, точным трекером загрузок Steam/браузера, реальными иконками программ и изоляцией визуализации только на музыку.
 
 ## Ключевые возможности v2.2
 - **Нативное Rust-ядро v2.2 (`rust_core/` → `island_core.dll`)**:
