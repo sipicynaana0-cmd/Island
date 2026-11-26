@@ -517,22 +517,164 @@ def extract_palette_from_image(img_bytes: bytes) -> Tuple[Tuple[int, int, int], 
 class AudioEngine:
     """
     Lock-free background Windows Core Audio engine.
-    Polls WASAPI Peak Meter, Master Volume, and Per-App Audio Sessions on a dedicated
-    background thread so the 120 FPS UI thread never touches COM or blocks for even 0.1ms!
+    - Real-time spectrum analyzer: captures the system mix via WASAPI loopback and runs an FFT
+      into 32 logarithmic bands (40 Hz .. 16 kHz) with automatic gain, so the visualizers react
+      to the ACTUAL music (kick, vocals, hi-hats) instead of a fake sine animation.
+    - Master volume, per-app sessions and peak meter on a separate COM thread.
+    The 120 FPS UI thread only reads cached floats and never blocks.
     """
+
+    N_BANDS = 32
 
     def __init__(self):
         self._cached_vol: float = 50.0
         self._cached_mute: bool = False
         self._cached_peak: float = 0.0
-        self._smooth_bands: List[float] = [0.04] * 32
+        self._raw_bands: List[float] = [0.0] * self.N_BANDS
+        self._raw_level: float = 0.0
+        self._spectrum_live: bool = False
+        self._spectrum_ts: float = 0.0
+        self._smooth_bands: List[float] = [0.0] * self.N_BANDS
+        self._smooth_peak: float = 0.0
+        self._last_bands_t: float = time.monotonic()
         self._cached_sessions: List[AppAudioSession] = []
-        self._phase: float = 0.0
         self._cmd_queue: List[Tuple[str, object]] = []
         self._want_sessions_poll: bool = False
         self._running: bool = True
         self._thread = threading.Thread(target=self._bg_audio_loop, daemon=True)
         self._thread.start()
+        self._spec_thread = threading.Thread(target=self._bg_spectrum_loop, daemon=True)
+        self._spec_thread.start()
+
+    # ------------------------------------------------------------------ spectrum
+    def _bg_spectrum_loop(self):
+        try:
+            import numpy as np
+            import pyaudiowpatch as pyaudio
+        except Exception:
+            return  # library missing -> peak-meter fallback in get_peak_and_bands
+
+        n_fft = 2048
+        hop = 768
+        window = np.hanning(n_fft).astype(np.float32)
+        ring = np.zeros(n_fft, dtype=np.float32)
+        agc_db = -30.0
+
+        while self._running:
+            pa = None
+            stream = None
+            try:
+                pa = pyaudio.PyAudio()
+                wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+                spk = pa.get_device_info_by_index(wasapi["defaultOutputDevice"])
+                loop_dev = None
+                if spk.get("isLoopbackDevice"):
+                    loop_dev = spk
+                else:
+                    for d in pa.get_loopback_device_info_generator():
+                        if spk["name"] in d["name"]:
+                            loop_dev = d
+                            break
+                if loop_dev is None:
+                    raise RuntimeError("no loopback device")
+
+                sr = int(loop_dev["defaultSampleRate"])
+                ch = max(1, int(loop_dev["maxInputChannels"]))
+                stream = pa.open(
+                    format=pyaudio.paFloat32,
+                    channels=ch,
+                    rate=sr,
+                    input=True,
+                    input_device_index=loop_dev["index"],
+                    frames_per_buffer=hop,
+                )
+
+                # Logarithmic band edges mapped to FFT bins
+                freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+                edges = np.geomspace(40.0, min(16000.0, sr * 0.45), self.N_BANDS + 1)
+                bin_lo = [max(1, int(np.searchsorted(freqs, edges[i]))) for i in range(self.N_BANDS)]
+                bin_hi = [max(bin_lo[i] + 1, int(np.searchsorted(freqs, edges[i + 1]))) for i in range(self.N_BANDS)]
+                centers = np.sqrt(edges[:-1] * edges[1:])
+                # +3.5 dB/octave tilt so mids & highs are as visible as the bass
+                tilt = (3.5 * np.log2(centers / 250.0)).astype(np.float32)
+
+                dev_name = spk["name"]
+                last_dev_check = time.monotonic()
+                silent_since = None
+
+                while self._running:
+                    avail = stream.get_read_available()
+                    if avail < hop:
+                        time.sleep(0.004)
+                        # Loopback delivers nothing while the device is silent -> decay to zero
+                        if silent_since is None:
+                            silent_since = time.monotonic()
+                        elif time.monotonic() - silent_since > 0.12:
+                            self._raw_bands = [0.0] * self.N_BANDS
+                            self._raw_level = 0.0
+                            self._spectrum_ts = time.monotonic()
+                            self._spectrum_live = True
+                        # Re-open if the default output device was switched
+                        if time.monotonic() - last_dev_check > 2.5:
+                            last_dev_check = time.monotonic()
+                            try:
+                                cur = pa.get_device_info_by_index(
+                                    pa.get_host_api_info_by_type(pyaudio.paWASAPI)["defaultOutputDevice"]
+                                )
+                                if cur["name"] != dev_name:
+                                    break
+                            except Exception:
+                                break
+                        continue
+                    silent_since = None
+
+                    raw = stream.read(hop, exception_on_overflow=False)
+                    data = np.frombuffer(raw, dtype=np.float32)
+                    if ch > 1:
+                        data = data.reshape(-1, ch).mean(axis=1)
+                    n = len(data)
+                    ring = np.roll(ring, -n)
+                    ring[-n:] = data
+
+                    rms = float(np.sqrt(np.mean(data * data)) + 1e-12)
+                    if rms < 2e-5:
+                        self._raw_bands = [0.0] * self.N_BANDS
+                        self._raw_level = 0.0
+                        self._spectrum_ts = time.monotonic()
+                        self._spectrum_live = True
+                        continue
+
+                    mag = np.abs(np.fft.rfft(ring * window)) ** 2
+                    db = np.empty(self.N_BANDS, dtype=np.float32)
+                    for i in range(self.N_BANDS):
+                        db[i] = 10.0 * math.log10(float(mag[bin_lo[i]:bin_hi[i]].mean()) + 1e-12)
+                    db += tilt
+
+                    # Automatic gain: follows the loudest band (fast up, slow down)
+                    top = float(db.max())
+                    agc_db = top if top > agc_db else agc_db + (top - agc_db) * 0.012
+                    rng = 42.0
+                    norm = np.clip((db - (agc_db - rng)) / rng, 0.0, 1.0) ** 1.35
+
+                    self._raw_bands = norm.tolist()
+                    level_db = 20.0 * math.log10(rms)
+                    self._raw_level = max(0.0, min(1.0, (level_db + 48.0) / 40.0))
+                    self._spectrum_ts = time.monotonic()
+                    self._spectrum_live = True
+            except Exception:
+                self._spectrum_live = False
+            finally:
+                try:
+                    if stream is not None:
+                        stream.close()
+                except Exception:
+                    pass
+                try:
+                    if pa is not None:
+                        pa.terminate()
+                except Exception:
+                    pass
+            time.sleep(1.0)
 
     def request_sessions_refresh(self):
         self._want_sessions_poll = True
@@ -551,33 +693,35 @@ class AudioEngine:
         return self._cached_mute
 
     def get_peak_and_bands(self, is_playing: bool = False) -> Tuple[float, List[float]]:
-        """Instant 0.001ms read of smoothed 32-band frequency array updated at 120Hz."""
-        peak = self._cached_peak
-        if peak < 0.012 and is_playing:
-            peak = 0.25 + 0.15 * math.sin(time.monotonic() * 4.8)
+        """
+        Instant read of the smoothed 32-band spectrum. Frame-rate independent attack/release:
+        bars jump up instantly on a beat and fall back smoothly like a real analyzer.
+        """
+        now = time.monotonic()
+        dt = max(0.001, min(0.1, now - self._last_bands_t))
+        self._last_bands_t = now
 
-        self._phase += 0.16 + peak * 0.38
-        for i in range(32):
-            if peak > 0.012:
-                # Left = deep bass (slower, taller), Middle = vocals, Right = crisp treble
-                norm_x = i / 31.0
-                bass_bias = 1.15 - norm_x * 0.35
-                freq_weight = (math.sin(norm_x * math.pi) * 0.75 + 0.35) * bass_bias
-                wave = (
-                    math.sin(self._phase * (0.9 + norm_x * 1.9) + i * 0.55) * 0.52
-                    + math.cos(self._phase * (1.6 - norm_x * 0.7) + i * 1.15) * 0.48
-                )
-                target = max(0.05, min(1.0, peak * freq_weight * (0.82 + 0.58 * wave)))
-            else:
-                target = 0.035 + 0.015 * math.sin(self._phase * 0.4 + i * 0.4)
+        live = self._spectrum_live and (now - self._spectrum_ts) < 0.6
+        if live:
+            targets = self._raw_bands
+            level = self._raw_level
+        else:
+            # Fallback: real hardware peak meter, flat across bands (no fake animation)
+            level = max(0.0, min(1.0, self._cached_peak * 1.4))
+            targets = [level * (0.9 - 0.35 * (i / (self.N_BANDS - 1))) for i in range(self.N_BANDS)]
 
-            curr = self._smooth_bands[i]
-            if target > curr:
-                self._smooth_bands[i] = curr + (target - curr) * 0.48
-            else:
-                self._smooth_bands[i] = curr + (target - curr) * 0.20
+        attack = 1.0 - math.exp(-dt / 0.028)
+        release = 1.0 - math.exp(-dt / 0.16)
+        sb = self._smooth_bands
+        for i in range(self.N_BANDS):
+            t = targets[i] if i < len(targets) else 0.0
+            c = sb[i]
+            sb[i] = c + (t - c) * (attack if t > c else release)
 
-        return peak, list(self._smooth_bands)
+        bass = (sb[0] + sb[1] + sb[2] + sb[3] + sb[4]) / 5.0
+        tgt_peak = max(level * 0.85, bass)
+        self._smooth_peak += (tgt_peak - self._smooth_peak) * (attack if tgt_peak > self._smooth_peak else release)
+        return self._smooth_peak, list(sb)
 
     def get_app_sessions(self) -> List[AppAudioSession]:
         self._want_sessions_poll = True
