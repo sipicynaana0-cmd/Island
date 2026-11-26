@@ -18,7 +18,8 @@
 //!   - rust_eval_math_expr(...) -> safe recursive-descent calculator for Spotlight
 
 use std::f32::consts::PI;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -180,6 +181,26 @@ extern "system" {
         cb_file_info: u32,
         u_flags: u32,
     ) -> usize;
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn RegOpenKeyExW(
+        h_key: isize,
+        lp_sub_key: *const u16,
+        ul_options: u32,
+        sam_desired: u32,
+        phk_result: *mut usize,
+    ) -> i32;
+    fn RegQueryValueExW(
+        h_key: usize,
+        lp_value_name: *const u16,
+        lp_reserved: *mut u32,
+        lp_type: *mut u32,
+        lp_data: *mut u8,
+        lpcb_data: *mut u32,
+    ) -> i32;
+    fn RegCloseKey(h_key: usize) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -401,7 +422,7 @@ fn ft_to_u64(ft: FileTime) -> u64 {
 // -----------------------------------------------------------------------------
 #[no_mangle]
 pub extern "C" fn rust_core_version() -> u32 {
-    220
+    230
 }
 
 #[no_mangle]
@@ -857,21 +878,61 @@ pub unsafe extern "C" fn rust_extract_file_icon_rgba(
 }
 
 // -----------------------------------------------------------------------------
-// Native Multi-Library Steam Download Progress & Speed Scanner (Feature #11)
+// Native Accurate Multi-Library Steam Download Scanner v2.3 (Registry + content_log + ACF)
 // -----------------------------------------------------------------------------
 struct SteamDlTrack {
     last_app: String,
-    last_bytes: u64,
-    last_time: Option<Instant>,
+    last_acf_bytes: u64,
+    est_bytes: f64,
+    last_acf_time: Option<Instant>,
+    last_tick: Option<Instant>,
     smooth_mbps: f32,
 }
 
 static STEAM_DL_STATE: Mutex<SteamDlTrack> = Mutex::new(SteamDlTrack {
     last_app: String::new(),
-    last_bytes: 0,
-    last_time: None,
+    last_acf_bytes: 0,
+    est_bytes: 0.0,
+    last_acf_time: None,
+    last_tick: None,
     smooth_mbps: 0.0,
 });
+
+fn read_steam_root_from_registry() -> Option<PathBuf> {
+    unsafe {
+        const HKEY_CURRENT_USER: isize = -2147483647; // 0x80000001
+        const KEY_READ: u32 = 0x20019;
+        let subkey: Vec<u16> = "Software\\Valve\\Steam\0".encode_utf16().collect();
+        let val_name: Vec<u16> = "SteamPath\0".encode_utf16().collect();
+        let mut hkey: usize = 0;
+        if RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
+            return None;
+        }
+        let mut buf = [0u16; 260];
+        let mut cb_data = (buf.len() * 2) as u32;
+        let mut reg_type = 0u32;
+        let ok = RegQueryValueExW(
+            hkey,
+            val_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut reg_type,
+            buf.as_mut_ptr() as *mut u8,
+            &mut cb_data,
+        );
+        RegCloseKey(hkey);
+        if ok == 0 && cb_data >= 2 {
+            let n_u16 = (cb_data as usize / 2).min(buf.len());
+            let s = String::from_utf16_lossy(&buf[..n_u16])
+                .trim_end_matches('\0')
+                .replace('/', "\\");
+            let p = PathBuf::from(s);
+            if p.is_dir() {
+                return Some(p);
+            }
+        }
+        None
+    }
+}
 
 fn extract_vdf_field<'a>(content: &'a str, key: &str) -> Option<&'a str> {
     let needle = format!("\"{}\"", key);
@@ -889,44 +950,141 @@ fn extract_vdf_field<'a>(content: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
-fn collect_steamapps_dirs() -> Vec<PathBuf> {
+fn collect_steam_roots_and_apps() -> (Option<PathBuf>, Vec<PathBuf>) {
     let mut dirs = Vec::new();
-    let defaults = [
-        r"C:\Program Files (x86)\Steam\steamapps",
-        r"C:\Program Files\Steam\steamapps",
-        r"D:\Steam\steamapps",
-        r"D:\SteamLibrary\steamapps",
-        r"E:\SteamLibrary\steamapps",
-    ];
-    for d in &defaults {
+    let reg_root = read_steam_root_from_registry();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(ref r) = reg_root {
+        roots.push(r.clone());
+    }
+    for d in &[
+        r"C:\Program Files (x86)\Steam",
+        r"C:\Program Files\Steam",
+        r"D:\Steam",
+        r"E:\Steam",
+    ] {
         let p = PathBuf::from(d);
-        if p.is_dir() && !dirs.contains(&p) {
-            dirs.push(p);
+        if p.is_dir() && !roots.iter().any(|x| x.to_string_lossy().eq_ignore_ascii_case(&p.to_string_lossy())) {
+            roots.push(p);
         }
     }
-    // Parse libraryfolders.vdf to discover any custom Steam drives
-    let vdf_candidates = [
-        r"C:\Program Files (x86)\Steam\steamapps\libraryfolders.vdf",
-        r"C:\Program Files\Steam\steamapps\libraryfolders.vdf",
-    ];
-    for vdf_p in &vdf_candidates {
-        if let Ok(txt) = fs::read_to_string(vdf_p) {
+
+    let primary_root = roots.first().cloned();
+    for r in &roots {
+        let sa = r.join("steamapps");
+        if sa.is_dir() && !dirs.iter().any(|x: &PathBuf| x.to_string_lossy().eq_ignore_ascii_case(&sa.to_string_lossy())) {
+            dirs.push(sa.clone());
+        }
+        let vdf = sa.join("libraryfolders.vdf");
+        if let Ok(txt) = fs::read_to_string(&vdf) {
             for line in txt.lines() {
                 if let Some(raw_path) = extract_vdf_field(line, "path") {
                     let clean = raw_path.replace("\\\\", "\\");
-                    let sa = Path::new(&clean).join("steamapps");
-                    if sa.is_dir() && !dirs.contains(&sa) {
-                        dirs.push(sa);
+                    let lib_sa = Path::new(&clean).join("steamapps");
+                    if lib_sa.is_dir()
+                        && !dirs
+                            .iter()
+                            .any(|x: &PathBuf| x.to_string_lossy().eq_ignore_ascii_case(&lib_sa.to_string_lossy()))
+                    {
+                        dirs.push(lib_sa);
                     }
                 }
             }
         }
     }
-    dirs
+    for extra in &[r"D:\SteamLibrary\steamapps", r"E:\SteamLibrary\steamapps"] {
+        let p = PathBuf::from(extra);
+        if p.is_dir() && !dirs.iter().any(|x| x.to_string_lossy().eq_ignore_ascii_case(&p.to_string_lossy())) {
+            dirs.push(p);
+        }
+    }
+    (primary_root, dirs)
 }
 
-/// Scans all Steam libraries for an actively downloading or updating game.
-/// Returns 1 if an active Steam download is found, 0 otherwise.
+/// Parses the tail of Steam's logs/content_log.txt for the REAL active AppID and REAL live speed (MB/s).
+/// Returns (active_appid, live_mb_per_sec, is_actively_running).
+fn parse_steam_content_log(steam_root: &Path) -> (Option<String>, f32, bool) {
+    let log_path = steam_root.join("logs").join("content_log.txt");
+    let mut f = match File::open(&log_path) {
+        Ok(file) => file,
+        Err(_) => return (None, 0.0, false),
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let read_sz = len.min(24_576);
+    if len > read_sz {
+        let _ = f.seek(SeekFrom::End(-(read_sz as i64)));
+    }
+    let mut buf = Vec::with_capacity(read_sz as usize);
+    if f.read_to_end(&mut buf).is_err() {
+        return (None, 0.0, false);
+    }
+    let text = String::from_utf8_lossy(&buf);
+
+    let mut active_app: Option<String> = None;
+    let mut live_mb_s: f32 = 0.0;
+    let mut is_running = false;
+
+    for line in text.lines() {
+        // Parse exact download rate lines from Steam:
+        // "Current download rate: 48.210 Mbps"
+        if let Some(pos) = line.find("Current download rate:") {
+            let rest = line[pos + "Current download rate:".len()..].trim();
+            if let Some(num_str) = rest.split_whitespace().next() {
+                if let Ok(mbps_bits) = num_str.parse::<f32>() {
+                    live_mb_s = (mbps_bits / 8.0).max(0.0);
+                }
+            }
+        } else if let Some(pos) = line.find(", now ") {
+            // "Increasing target number of download connections to 5 (rate was 0.000, now 39.301)"
+            let rest = &line[pos + 6..];
+            let num_str = rest.trim_end_matches(')').trim();
+            if let Ok(mbps_bits) = num_str.parse::<f32>() {
+                if mbps_bits > 0.05 {
+                    live_mb_s = mbps_bits / 8.0;
+                }
+            }
+        }
+
+        // Track AppID update state transitions:
+        if let Some(pos) = line.find("AppID ") {
+            let rest = &line[pos + 6..];
+            let mut parts = rest.splitn(2, ' ');
+            let appid = parts.next().unwrap_or("").trim();
+            let detail = parts.next().unwrap_or("");
+            if appid.is_empty() || !appid.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            if detail.contains("App update changed :") {
+                if detail.contains("Running Update") && !detail.contains("Stopping") {
+                    if appid != "228980" || active_app.is_none() {
+                        active_app = Some(appid.to_string());
+                        is_running = true;
+                    }
+                } else if detail.contains("None") || detail.contains("Stopping") {
+                    if active_app.as_deref() == Some(appid) {
+                        active_app = None;
+                        is_running = false;
+                        live_mb_s = 0.0;
+                    }
+                }
+            } else if detail.contains("update canceled")
+                || detail.contains("(Suspended)")
+                || detail.contains("finished update")
+                || detail.contains("finished uninstall")
+            {
+                if active_app.as_deref() == Some(appid) {
+                    active_app = None;
+                    is_running = false;
+                    live_mb_s = 0.0;
+                }
+            }
+        }
+    }
+    (active_app, live_mb_s, is_running)
+}
+
+/// Scans Steam (Registry + content_log + all steamapps libraries) for an actively running game download.
+/// Returns 1 ONLY when a download/patch is genuinely running (never when paused/suspended/finished!).
 #[no_mangle]
 pub unsafe extern "C" fn rust_poll_steam_download(
     out_name_utf8: *mut u8,
@@ -937,7 +1095,13 @@ pub unsafe extern "C" fn rust_poll_steam_download(
     if out_name_utf8.is_null() || out_pct.is_null() || out_mbps.is_null() || max_name_len < 4 {
         return 0;
     }
-    let dirs = collect_steamapps_dirs();
+    let (primary_root, dirs) = collect_steam_roots_and_apps();
+    let (log_appid, log_mb_s, log_running) = match primary_root {
+        Some(ref r) => parse_steam_content_log(r),
+        None => (None, 0.0, false),
+    };
+
+    // If Steam's own content_log says nothing is running, do NOT show stale/paused ACF flags!
     let mut best: Option<(String, String, u64, u64)> = None;
 
     for dir in dirs {
@@ -955,67 +1119,114 @@ pub unsafe extern "C" fn rust_poll_steam_download(
                 Ok(c) => c,
                 Err(_) => continue,
             };
+            let appid = extract_vdf_field(&content, "appid").unwrap_or("0").to_string();
             let flags: u32 = extract_vdf_field(&content, "StateFlags")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            // Steam StateFlags: 1024 = Downloading, 2048 = Preallocating, 512 = Staging, 2 = UpdateRequired
-            let is_active = (flags & (1024 | 512 | 2048)) != 0;
-            if !is_active {
+
+            // Bit 2048 (0x800) = UpdatePaused; Bit 256 (0x100) = UpdateRunning
+            let is_paused = (flags & 2048) != 0;
+            let acf_running = (flags & 256) != 0 && !is_paused;
+            let log_matches = log_running && log_appid.as_deref() == Some(appid.as_str());
+            if !acf_running && !log_matches {
                 continue;
             }
+            if !log_running && log_appid.is_none() && !acf_running {
+                continue;
+            }
+
             let to_dl: u64 = extract_vdf_field(&content, "BytesToDownload")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
             let done_dl: u64 = extract_vdf_field(&content, "BytesDownloaded")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            if to_dl == 0 || done_dl >= to_dl {
+            let to_st: u64 = extract_vdf_field(&content, "BytesToStage")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let done_st: u64 = extract_vdf_field(&content, "BytesStaged")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+            let (done_eff, total_eff) = if to_dl > 0 && done_dl < to_dl {
+                (done_dl, to_dl)
+            } else if to_st > 0 && done_st < to_st {
+                (done_st, to_st)
+            } else {
                 continue;
-            }
-            let appid = extract_vdf_field(&content, "appid").unwrap_or("0").to_string();
+            };
+
             let name = extract_vdf_field(&content, "name").unwrap_or("Steam").to_string();
-            best = Some((appid, name, done_dl, to_dl));
-            break;
+            // Prefer exact log_appid match or non-redist game
+            if log_matches {
+                best = Some((appid, name, done_eff, total_eff));
+                break;
+            } else if best.is_none() && appid != "228980" {
+                best = Some((appid, name, done_eff, total_eff));
+            }
         }
-        if best.is_some() {
+        if best.is_some() && log_running {
             break;
         }
     }
 
-    if let Some((appid, name, done_dl, to_dl)) = best {
-        let pct = ((done_dl as f64 / (to_dl.max(1) as f64)) * 100.0).clamp(0.0, 99.9) as f32;
-        let mut mbps = 0.0f32;
+    if let Some((appid, name, done_acf, total_bytes)) = best {
+        let mut mb_s = log_mb_s;
+        let mut live_done = done_acf as f64;
+
         if let Ok(mut st) = STEAM_DL_STATE.lock() {
             let now = Instant::now();
             if st.last_app == appid {
-                if let Some(prev_t) = st.last_time {
-                    let dt = now.duration_since(prev_t).as_secs_f32();
-                    if dt > 0.25 && done_dl >= st.last_bytes {
-                        let inst_mbps = ((done_dl - st.last_bytes) as f32) / (1_048_576.0 * dt);
-                        st.smooth_mbps = if st.smooth_mbps <= 0.01 {
-                            inst_mbps
-                        } else {
-                            st.smooth_mbps * 0.65 + inst_mbps * 0.35
-                        };
-                        st.last_bytes = done_dl;
-                        st.last_time = Some(now);
+                let dt_tick = st.last_tick.map(|t| now.duration_since(t).as_secs_f64()).unwrap_or(0.0).min(3.0);
+                if done_acf > st.last_acf_bytes {
+                    // ACF just flushed real disk bytes -> compute fallback rate & re-anchor!
+                    if let Some(prev_t) = st.last_acf_time {
+                        let dt_acf = now.duration_since(prev_t).as_secs_f32();
+                        if dt_acf > 0.3 {
+                            let acf_rate = ((done_acf - st.last_acf_bytes) as f32) / (1_048_576.0 * dt_acf);
+                            if mb_s < 0.05 {
+                                mb_s = acf_rate;
+                            }
+                        }
                     }
+                    st.last_acf_bytes = done_acf;
+                    st.last_acf_time = Some(now);
+                    st.est_bytes = (done_acf as f64).max(st.est_bytes * 0.25 + (done_acf as f64) * 0.75);
+                } else if mb_s > 0.05 && dt_tick > 0.0 {
+                    // Smoothly integrate live download bytes between delayed Steam ACF flushes!
+                    let max_ahead = (done_acf as f64) + (total_bytes as f64) * 0.06;
+                    st.est_bytes = (st.est_bytes + (mb_s as f64) * 1_048_576.0 * dt_tick)
+                        .min(max_ahead)
+                        .min((total_bytes.saturating_sub(1)) as f64);
                 }
+                if mb_s > 0.01 {
+                    st.smooth_mbps = if st.smooth_mbps <= 0.01 {
+                        mb_s
+                    } else {
+                        st.smooth_mbps * 0.6 + mb_s * 0.4
+                    };
+                }
+                st.last_tick = Some(now);
+                live_done = st.est_bytes.max(done_acf as f64);
+                mb_s = st.smooth_mbps;
             } else {
                 st.last_app = appid;
-                st.last_bytes = done_dl;
-                st.last_time = Some(now);
-                st.smooth_mbps = 0.0;
+                st.last_acf_bytes = done_acf;
+                st.est_bytes = done_acf as f64;
+                st.last_acf_time = Some(now);
+                st.last_tick = Some(now);
+                st.smooth_mbps = mb_s;
             }
-            mbps = st.smooth_mbps;
         }
+
+        let pct = ((live_done / (total_bytes.max(1) as f64)) * 100.0).clamp(0.0, 99.9) as f32;
         let nb = name.as_bytes();
         let copy_n = nb.len().min(max_name_len - 1);
         let out_slice = std::slice::from_raw_parts_mut(out_name_utf8, max_name_len);
         out_slice[..copy_n].copy_from_slice(&nb[..copy_n]);
         out_slice[copy_n] = 0;
         *out_pct = pct;
-        *out_mbps = mbps;
+        *out_mbps = mb_s;
         return 1;
     }
     0
