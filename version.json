@@ -1,0 +1,14 @@
+{
+  "version": "1.3.0",
+  "repo": "sipicynaana0-cmd/Island",
+  "released_at": "2026-11-26",
+  "notes": "Мгновенная синхронизация перемотки, кнопки Нравится/Не нравится, авто-погода, встроенное автообновление из GitHub и Политика конфиденциальности",
+  "files": [
+    "backend.py",
+    "island_ui.py",
+    "main.py",
+    "version.json",
+    "PRIVACY_POLICY.md",
+    "USER_CONSENT.md"
+  ]
+}
