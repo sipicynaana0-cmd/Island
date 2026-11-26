@@ -892,13 +892,17 @@ class DynamicIslandWidget(QWidget):
         self._screen_h = 1080
         self._reposition_canvas()
 
-        # Core Capsule Springs
-        self.sp_w = SpringValue(210.0, stiffness=420.0, damping=36.0)
-        self.sp_h = SpringValue(36.0, stiffness=420.0, damping=36.0)
-        self.sp_r = SpringValue(18.0, stiffness=440.0, damping=36.0)
-        self.sp_expand = SpringValue(0.0, stiffness=360.0, damping=33.0)
-        self.sp_osd = SpringValue(0.0, stiffness=440.0, damping=35.0)
-        self.sp_cascade = SpringValue(0.0, stiffness=320.0, damping=28.0)
+        # Core Capsule Springs (Critically damped: 2*sqrt(420) ~= 41.0 -> zero overshoot jitter, locked phase!)
+        self.sp_w = SpringValue(210.0, stiffness=420.0, damping=41.0)
+        self.sp_h = SpringValue(36.0, stiffness=420.0, damping=41.0)
+        self.sp_r = SpringValue(18.0, stiffness=420.0, damping=41.0)
+        self.sp_expand = SpringValue(0.0, stiffness=420.0, damping=41.0)
+        self.sp_osd = SpringValue(0.0, stiffness=440.0, damping=42.0)
+        self.sp_cascade = SpringValue(0.0, stiffness=400.0, damping=40.0)
+        self.sp_top_y = SpringValue(9.0 if self.consent_mgr.island_float_mode == 1 else 0.0, stiffness=400.0, damping=40.0)
+        self._notif_subtitle: str = ""
+        self._notif_app: str = ""
+        self._notif_target: str = ""
 
         # Ferrofluid magnetic bottom pull & smooth cursor tracking
         self.sp_ferro_pull = SpringValue(0.0, stiffness=340.0, damping=26.0)
@@ -1117,12 +1121,25 @@ class DynamicIslandWidget(QWidget):
         cw = max(120.0, self.sp_w.value)
         ch = max(26.0, self.sp_h.value)
         cx = (self.MAX_CANVAS_W - cw) / 2.0
-        return QRectF(cx, 0.0, cw, ch)
+        ty = max(0.0, self.sp_top_y.value)
+        return QRectF(cx, ty, cw, ch)
 
-    def _trigger_osd(self, osd_type: str, text: str = "", value: float = 0.0, duration: float = 1.45):
+    def _trigger_osd(
+        self,
+        osd_type: str,
+        text: str = "",
+        value: float = 0.0,
+        duration: float = 1.45,
+        subtitle: str = "",
+        app_name: str = "",
+        target_kw: str = "",
+    ):
         self._osd_type = osd_type
         self._osd_text = text
         self._osd_value = value
+        self._notif_subtitle = subtitle
+        self._notif_app = app_name
+        self._notif_target = target_kw
         self._osd_until = time.monotonic() + duration
         self._update_target_dimensions()
         self._ensure_anim_running()
@@ -1158,38 +1175,44 @@ class DynamicIslandWidget(QWidget):
 
         self.sp_osd.set_target(1.0 if osd_active else 0.0)
         self.sp_cascade.set_target(1.0 if expanded else 0.0)
+        self.sp_top_y.set_target(9.0 if self.consent_mgr.island_float_mode == 1 else 0.0)
 
         for i in range(8):
             self.tab_open_sp[i].set_target(1.0 if i == self.active_tab else 0.0)
 
         if updating_now:
-            self.sp_w.set_target(368.0, stiffness=340.0, damping=32.0)
-            self.sp_h.set_target(52.0, stiffness=340.0, damping=32.0)
+            self.sp_w.set_target(368.0, stiffness=400.0, damping=40.0)
+            self.sp_h.set_target(52.0, stiffness=400.0, damping=40.0)
             self.sp_r.set_target(24.0)
             self.sp_expand.set_target(0.0)
         elif expanded:
-            self.sp_w.set_target(self.EXPANDED_W, stiffness=380.0, damping=34.0)
-            self.sp_h.set_target(self.EXPANDED_H, stiffness=380.0, damping=34.0)
+            self.sp_w.set_target(self.EXPANDED_W, stiffness=420.0, damping=41.0)
+            self.sp_h.set_target(self.EXPANDED_H, stiffness=420.0, damping=41.0)
             self.sp_r.set_target(28.0)
             self.sp_expand.set_target(1.0)
         elif osd_active:
-            self.sp_w.set_target(286.0, stiffness=440.0, damping=34.0)
-            self.sp_h.set_target(42.0, stiffness=440.0, damping=34.0)
-            self.sp_r.set_target(20.0)
+            if self._osd_type == "notif":
+                self.sp_w.set_target(372.0, stiffness=420.0, damping=41.0)
+                self.sp_h.set_target(54.0, stiffness=420.0, damping=41.0)
+                self.sp_r.set_target(24.0)
+            else:
+                self.sp_w.set_target(286.0, stiffness=420.0, damping=41.0)
+                self.sp_h.set_target(42.0, stiffness=420.0, damping=41.0)
+                self.sp_r.set_target(20.0)
             self.sp_expand.set_target(0.0)
         elif has_media:
-            self.sp_w.set_target(324.0, stiffness=420.0, damping=34.0)
-            self.sp_h.set_target(40.0, stiffness=420.0, damping=34.0)
+            self.sp_w.set_target(332.0, stiffness=420.0, damping=41.0)
+            self.sp_h.set_target(40.0, stiffness=420.0, damping=41.0)
             self.sp_r.set_target(19.0)
             self.sp_expand.set_target(0.0)
         elif self.timer_running:
-            self.sp_w.set_target(258.0, stiffness=420.0, damping=34.0)
-            self.sp_h.set_target(36.0, stiffness=420.0, damping=34.0)
+            self.sp_w.set_target(258.0, stiffness=420.0, damping=41.0)
+            self.sp_h.set_target(36.0, stiffness=420.0, damping=41.0)
             self.sp_r.set_target(18.0)
             self.sp_expand.set_target(0.0)
         else:
-            self.sp_w.set_target(208.0, stiffness=420.0, damping=34.0)
-            self.sp_h.set_target(36.0, stiffness=420.0, damping=34.0)
+            self.sp_w.set_target(214.0, stiffness=420.0, damping=41.0)
+            self.sp_h.set_target(36.0, stiffness=420.0, damping=41.0)
             self.sp_r.set_target(18.0)
             self.sp_expand.set_target(0.0)
 
@@ -1264,6 +1287,18 @@ class DynamicIslandWidget(QWidget):
             label = "Русская" if kb == "RU" else "English" if kb == "EN" else kb
             self._trigger_osd("lang", label, duration=1.25)
 
+        # Check for live incoming Telegram / Discord / Microphone / Headphone notifications (Items 1 & 2)
+        new_notif = self.telemetry.pop_notification()
+        if new_notif:
+            self._trigger_osd(
+                "notif",
+                new_notif.get("title", "Уведомление"),
+                duration=3.2,
+                subtitle=new_notif.get("subtitle", ""),
+                app_name=new_notif.get("app", ""),
+                target_kw=new_notif.get("target", ""),
+            )
+
         if not self._dragging_vol_slider:
             vol, muted = self.audio.get_master_volume()
             if abs(vol - self._last_master_vol) >= 1.0 or muted != self._last_master_mute:
@@ -1321,6 +1356,7 @@ class DynamicIslandWidget(QWidget):
         self.sp_expand.step(dt)
         self.sp_osd.step(dt)
         self.sp_cascade.step(dt)
+        self.sp_top_y.step(dt)
         self.sp_ferro_pull.step(dt)
         self.sp_ferro_x.step(dt)
         self.sp_tab_trans.step(dt)
@@ -1372,27 +1408,7 @@ class DynamicIslandWidget(QWidget):
                 sp[0] = (sp[0] + math.sin(self._wave_phase * 0.5 + sp[1] * 6.0) * 0.04 * dt) % 1.0
 
         if self.sp_expand.value > 0.3:
-            self._app_sessions = self.audio.get_app_sessions()
-
-        # Adaptive frame rate: full 120 FPS while anything moves or music plays, 30 FPS when idle
-        moving = (
-            abs(self.sp_w.velocity) > 0.4
-            or abs(self.sp_h.velocity) > 0.4
-            or abs(self.sp_expand.velocity) > 0.01
-            or abs(self.sp_ferro_pull.velocity) > 0.05
-            or self.sp_ferro_pull.value > 0.2
-        )
-        busy = (
-            moving
-            or track.is_playing
-            or self.sp_expand.value > 0.02
-            or self.sp_osd.value > 0.02
-            or self.is_updating_collapse
-            or self._ripples
-        )
-        want_iv = 8 if busy else 30
-        if self._anim_timer.interval() != want_iv:
-            self._anim_timer.setInterval(want_iv)
+            self._app_sessions = self.audio.get_app_sessions(trigger_poll=self.show_inline_mixer)
 
         self.update()
 
@@ -1465,6 +1481,13 @@ class DynamicIslandWidget(QWidget):
             return
 
         if self.sp_expand.value < 0.45:
+            if time.monotonic() < self._osd_until and self._osd_type == "notif":
+                self._osd_until = 0.0
+                if self._notif_target:
+                    focus_media_player_window(self._notif_target)
+                self._update_target_dimensions()
+                self._ensure_anim_running()
+                return
             self.is_pinned_open = True
             self.is_hovered = True
             self.sp_cascade.value = 0.0
@@ -1580,6 +1603,27 @@ class DynamicIslandWidget(QWidget):
             self.legal_doc_mode = ""
         elif key == "btn_toggle_consent":
             self.consent_mgr.set_accepted(not self.consent_mgr.accepted)
+        elif key == "btn_style_float":
+            self.consent_mgr.island_float_mode = (self.consent_mgr.island_float_mode + 1) % 2
+            self.consent_mgr.save_all()
+            self._update_target_dimensions()
+        elif key == "btn_style_wave":
+            self.consent_mgr.wave_style_mode = (self.consent_mgr.wave_style_mode + 1) % 3
+            self.consent_mgr.save_all()
+        elif key == "btn_style_bass":
+            self.consent_mgr.bass_sens_mode = (self.consent_mgr.bass_sens_mode + 1) % 3
+            self.consent_mgr.save_all()
+        elif key == "btn_test_notif":
+            self.is_pinned_open = False
+            self.is_hovered = False
+            self._trigger_osd(
+                "notif",
+                "Telegram · Новое сообщение",
+                duration=3.5,
+                subtitle="Кликни по капсуле, чтобы открыть окно",
+                app_name="Telegram",
+                target_kw="telegram",
+            )
         elif key == "qa_area":
             self.is_pinned_open = False
             self.is_hovered = False
@@ -1816,10 +1860,11 @@ class DynamicIslandWidget(QWidget):
         peak: float,
         bands: List[float],
     ) -> Tuple[QPainterPath, QPainterPath]:
-        ear = lerp(11.0, 18.0, exp)
+        float_t = clamp(self.sp_top_y.value / 9.0, 0.0, 1.0)
+        ear = lerp(11.0, 18.0, exp) * (1.0 - float_t)
         left = cap.left()
         right = cap.right()
-        top = 0.0
+        top = cap.top()
         bottom = cap.bottom()
         pull = self.sp_ferro_pull.value
         pull_x = self.sp_ferro_x.value
@@ -1831,10 +1876,12 @@ class DynamicIslandWidget(QWidget):
         wave_pts: List[QPointF] = []
 
         # Audio-reactive liquid edge: strictly driven by real FFT spectrum bands & bass peak.
-        # When silent or paused (peak ~ 0), wave_dy is 0.0 so the edge stays completely still!
+        # Respects user Wave Style (Item 6: 0=Неон, 1=Мягкая, 2=Выкл) and Bass Sensitivity!
         n_b = len(bands)
-        amp_max = lerp(7.0, 10.5, exp)
-        active_gate = clamp((peak - 0.012) / 0.05)
+        wave_mode = self.consent_mgr.wave_style_mode
+        wave_mult = 1.0 if wave_mode == 0 else (0.52 if wave_mode == 1 else 0.0)
+        amp_max = lerp(7.0, 10.5, exp) * wave_mult
+        active_gate = clamp((peak - 0.012) / 0.05) * (0.0 if wave_mode == 2 else 1.0)
 
         for i in range(num_pts + 1):
             t = i / num_pts
@@ -1852,7 +1899,7 @@ class DynamicIslandWidget(QWidget):
             dist_cursor = abs(px - self.sp_mx.value)
             cursor_ripple = (
                 math.cos(dist_cursor * 0.08 - self._wave_phase * 1.4)
-                * 1.6
+                * 1.4
                 * math.exp(-(dist_cursor * dist_cursor) / 3600.0)
                 * env
                 * exp
@@ -1863,23 +1910,41 @@ class DynamicIslandWidget(QWidget):
             wave_pts.append(QPointF(px, py))
 
         path = QPainterPath()
-        path.moveTo(left - ear, top)
-        path.quadTo(left, top, left, top + ear)
-        path.lineTo(left, bottom - br)
-        path.quadTo(left, bottom, x_start, wave_pts[0].y())
-
-        for i in range(len(wave_pts) - 1):
-            mid = QPointF(
-                (wave_pts[i].x() + wave_pts[i + 1].x()) * 0.5,
-                (wave_pts[i].y() + wave_pts[i + 1].y()) * 0.5,
-            )
-            path.quadTo(wave_pts[i], mid)
-        path.lineTo(wave_pts[-1])
-
-        path.quadTo(right, bottom, right, bottom - br)
-        path.lineTo(right, top + ear)
-        path.quadTo(right, top, right + ear, top)
-        path.closeSubpath()
+        if float_t > 0.25:
+            # Floating Capsule Mode (Парящая пилюля с отступом сверху и скруглёнными верхними углами)
+            top_r = lerp(4.0, br, float_t)
+            path.moveTo(left + top_r, top)
+            path.quadTo(left, top, left, top + top_r)
+            path.lineTo(left, bottom - br)
+            path.quadTo(left, bottom, x_start, wave_pts[0].y())
+            for i in range(len(wave_pts) - 1):
+                mid = QPointF(
+                    (wave_pts[i].x() + wave_pts[i + 1].x()) * 0.5,
+                    (wave_pts[i].y() + wave_pts[i + 1].y()) * 0.5,
+                )
+                path.quadTo(wave_pts[i], mid)
+            path.lineTo(wave_pts[-1])
+            path.quadTo(right, bottom, right, bottom - br)
+            path.lineTo(right, top + top_r)
+            path.quadTo(right, top, right - top_r, top)
+            path.closeSubpath()
+        else:
+            # Classic Top-Bezel Notch Mode (Вырез у края экрана)
+            path.moveTo(left - ear, top)
+            path.quadTo(left, top, left, top + ear)
+            path.lineTo(left, bottom - br)
+            path.quadTo(left, bottom, x_start, wave_pts[0].y())
+            for i in range(len(wave_pts) - 1):
+                mid = QPointF(
+                    (wave_pts[i].x() + wave_pts[i + 1].x()) * 0.5,
+                    (wave_pts[i].y() + wave_pts[i + 1].y()) * 0.5,
+                )
+                path.quadTo(wave_pts[i], mid)
+            path.lineTo(wave_pts[-1])
+            path.quadTo(right, bottom, right, bottom - br)
+            path.lineTo(right, top + ear)
+            path.quadTo(right, top, right + ear, top)
+            path.closeSubpath()
 
         edge_wave = QPainterPath()
         edge_wave.moveTo(wave_pts[0])
@@ -1906,7 +1971,10 @@ class DynamicIslandWidget(QWidget):
         osd_t = clamp(self.sp_osd.value, 0.0, 1.0)
 
         track, pos_sec = self.media.get_snapshot()
-        peak, bands = self.audio.get_peak_and_bands(track.is_playing)
+        raw_peak, raw_bands = self.audio.get_peak_and_bands(track.is_playing)
+        bass_mult = 1.0 if self.consent_mgr.bass_sens_mode == 0 else (1.55 if self.consent_mgr.bass_sens_mode == 1 else 0.62)
+        peak = clamp(raw_peak * bass_mult, 0.0, 1.0)
+        bands = [clamp(b * bass_mult, 0.0, 1.0) for b in raw_bands]
 
         # Live Anti-Screamer / Loudness Limiter when audio_fx_mode == 1
         if self.audio_fx_mode == 1 and peak > 0.82 and self._last_master_vol > 32:
@@ -1943,47 +2011,56 @@ class DynamicIslandWidget(QWidget):
             spot.setColorAt(1.0, QColor(0, 0, 0, 0))
             p.fillRect(cap, QBrush(spot))
 
-        if exp < 0.35:
+        if exp < 0.42:
             p.save()
-            p.setOpacity(clamp(1.0 - exp * 2.8))
+            p.setOpacity(clamp(1.0 - exp * 2.5))
             if osd_t > 0.15:
                 self._paint_osd_pill(p, cap, accent_col)
             else:
                 self._paint_folded_live_pill(p, cap, track, bands, accent_col)
             p.restore()
 
-        if exp > 0.12:
+        if exp > 0.06:
             p.save()
-            p.setOpacity(clamp((exp - 0.12) / 0.72))
-            self._paint_top_7tab_navbar(p, cap, accent_col)
+            p.setOpacity(clamp((exp - 0.06) / 0.58))
+            # Scale the 780x420 dashboard locked to the capsule's live width from top-center!
+            dash_x = (self.MAX_CANVAS_W - self.EXPANDED_W) * 0.5
+            dash_cap = QRectF(dash_x, cap.top(), float(self.EXPANDED_W), float(self.EXPANDED_H))
+            pivot = QPointF(self.MAX_CANVAS_W * 0.5, cap.top())
+            sc_exp = clamp(cap.width() / float(self.EXPANDED_W), 0.38, 1.0)
+            p.translate(pivot)
+            p.scale(sc_exp, sc_exp)
+            p.translate(-pivot)
 
-            content_top = 56.0
+            self._paint_top_7tab_navbar(p, dash_cap, accent_col)
+
+            content_top = dash_cap.top() + 56.0
             tab_fns = {
-                0: lambda painter: self._paint_tab_home(painter, cap, content_top, track, pos_sec, peak, bands, accent_col),
-                1: lambda painter: self._paint_tab_clipboard(painter, cap, content_top, accent_col),
-                2: lambda painter: self._paint_tab_shelf(painter, cap, content_top, accent_col),
-                3: lambda painter: self._paint_tab_text(painter, cap, content_top, accent_col),
-                4: lambda painter: self._paint_tab_note(painter, cap, content_top, accent_col),
-                5: lambda painter: self._paint_tab_weather(painter, cap, content_top, accent_col),
-                6: lambda painter: self._paint_tab_controls(painter, cap, content_top, accent_col),
-                7: lambda painter: self._paint_tab_updates(painter, cap, content_top, accent_col),
+                0: lambda painter: self._paint_tab_home(painter, dash_cap, content_top, track, pos_sec, peak, bands, accent_col),
+                1: lambda painter: self._paint_tab_clipboard(painter, dash_cap, content_top, accent_col),
+                2: lambda painter: self._paint_tab_shelf(painter, dash_cap, content_top, accent_col),
+                3: lambda painter: self._paint_tab_text(painter, dash_cap, content_top, accent_col),
+                4: lambda painter: self._paint_tab_note(painter, dash_cap, content_top, accent_col),
+                5: lambda painter: self._paint_tab_weather(painter, dash_cap, content_top, accent_col),
+                6: lambda painter: self._paint_tab_controls(painter, dash_cap, content_top, accent_col),
+                7: lambda painter: self._paint_tab_updates(painter, dash_cap, content_top, accent_col),
             }
 
             # Direct A -> B transition (Never flies across intermediate tabs!)
             tr_t = clamp(self.sp_tab_trans.value, 0.0, 1.0)
-            base_op = clamp((exp - 0.20) / 0.68)
+            base_op = clamp((exp - 0.12) / 0.62)
             dir_sign = 1.0 if self.active_tab >= self.prev_tab else -1.0
 
             if tr_t < 0.98 and self.prev_tab != self.active_tab:
                 p.save()
                 p.setOpacity(base_op * (1.0 - tr_t))
-                p.translate(-dir_sign * tr_t * 26.0, (1.0 - exp) * -14.0)
+                p.translate(-dir_sign * tr_t * 22.0, 0.0)
                 tab_fns[self.prev_tab](p)
                 p.restore()
 
             p.save()
             p.setOpacity(base_op * tr_t)
-            p.translate(dir_sign * (1.0 - tr_t) * 26.0, (1.0 - exp) * -14.0)
+            p.translate(dir_sign * (1.0 - tr_t) * 22.0, 0.0)
             tab_fns[self.active_tab](p)
             p.restore()
 
@@ -1991,7 +2068,7 @@ class DynamicIslandWidget(QWidget):
                 p.save()
                 rclip = QPainterPath()
                 rclip.addRoundedRect(rp.clip_rect, rp.clip_radius, rp.clip_radius)
-                p.setClipPath(rclip)
+                p.setClipPath(rclip, Qt.ClipOperation.IntersectClip)
                 rad = rp.progress * rp.max_radius
                 ralpha = int((1.0 - rp.progress) ** 1.6 * 95)
                 rr, rg, rb = rp.color
@@ -2008,24 +2085,52 @@ class DynamicIslandWidget(QWidget):
 
         p.restore()
 
-        wave_grad = QLinearGradient(QPointF(cap.left() + br, cap.bottom()), QPointF(cap.right() - br, cap.bottom()))
-        wave_grad.setColorAt(0.0, QColor(r1, g1, b1, 0))
-        wave_grad.setColorAt(0.14, QColor(r1, g1, b1, 230))
-        wave_grad.setColorAt(0.50, QColor(min(255, r1 + 35), min(255, g1 + 25), min(255, b1 + 35), 255))
-        wave_grad.setColorAt(0.86, QColor(142, 162, 255, 220))
-        wave_grad.setColorAt(1.0, QColor(142, 162, 255, 0))
-        # Soft beat-synced glow under the liquid edge (only visible when music is actually loud)
-        glow_a = clamp(peak * 1.3)
-        if glow_a > 0.04:
-            p.save()
-            p.setOpacity(glow_a * 0.45)
-            p.setPen(QPen(QBrush(wave_grad), 5.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        # Subtle outer rim when in Floating Capsule mode (Парящая пилюля)
+        if self.sp_top_y.value > 1.5:
+            p.setPen(QPen(QColor(255, 255, 255, int(clamp(self.sp_top_y.value / 9.0) * 36)), 1.0))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(island_path)
+
+        wave_mode = self.consent_mgr.wave_style_mode
+        if wave_mode != 2:
+            wave_grad = QLinearGradient(QPointF(cap.left() + br, cap.bottom()), QPointF(cap.right() - br, cap.bottom()))
+            wave_grad.setColorAt(0.0, QColor(r1, g1, b1, 0))
+            wave_grad.setColorAt(0.14, QColor(r1, g1, b1, 230 if wave_mode == 0 else 155))
+            wave_grad.setColorAt(0.50, QColor(min(255, r1 + 35), min(255, g1 + 25), min(255, b1 + 35), 255 if wave_mode == 0 else 185))
+            wave_grad.setColorAt(0.86, QColor(142, 162, 255, 220 if wave_mode == 0 else 145))
+            wave_grad.setColorAt(1.0, QColor(142, 162, 255, 0))
+            glow_a = clamp(peak * 1.3)
+            if wave_mode == 0 and glow_a > 0.04:
+                p.save()
+                p.setOpacity(glow_a * 0.45)
+                p.setPen(QPen(QBrush(wave_grad), 5.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawPath(bottom_wave_path)
+                p.restore()
+            p.setPen(QPen(QBrush(wave_grad), 1.95 if wave_mode == 0 else 1.35, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawPath(bottom_wave_path)
-            p.restore()
-        p.setPen(QPen(QBrush(wave_grad), 1.95, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawPath(bottom_wave_path)
+
+    def _paint_privacy_dots(self, p: QPainter, right_x: float, cy: float) -> float:
+        """Draws iOS-style Orange (Microphone) and Green (Camera) privacy indicator dots (Item 2)."""
+        breathe = 0.5 + 0.5 * math.sin(self._aurora_phase * 3.0)
+        if self.telemetry.cam_active:
+            pt = QPointF(right_x - 4.0, cy)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(48, 209, 88, int(65 + 45 * breathe)))
+            p.drawEllipse(pt, 5.5, 5.5)
+            p.setBrush(QColor(48, 209, 88, 255))
+            p.drawEllipse(pt, 3.1, 3.1)
+            right_x -= 11.0
+        if self.telemetry.mic_active:
+            pt = QPointF(right_x - 4.0, cy)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(255, 159, 10, int(65 + 45 * breathe)))
+            p.drawEllipse(pt, 5.5, 5.5)
+            p.setBrush(QColor(255, 159, 10, 255))
+            p.drawEllipse(pt, 3.1, 3.1)
+            right_x -= 11.0
+        return right_x
 
     # --- Folded Live Pill States ---
     def _paint_folded_live_pill(
@@ -2036,7 +2141,7 @@ class DynamicIslandWidget(QWidget):
         bands: List[float],
         accent_col: QColor,
     ):
-        cy = cap.height() * 0.48
+        cy = cap.top() + cap.height() * 0.48
         w_data = self.weather_worker.data
 
         # Dedicated Collapsed Update Loading Bar State (when user clicks 'Обновить')!
@@ -2085,7 +2190,6 @@ class DynamicIslandWidget(QWidget):
 
         if track.is_playing or track.title:
             playing = track.is_playing
-            # Cover art: gently "breathes" with the kick drum, dims when paused
             kick = clamp(peak_from_bands(bands)) if playing else 0.0
             art_s = 24.0 + kick * 2.2
             art_c = QPointF(cap.left() + 24.0, cy)
@@ -2100,7 +2204,7 @@ class DynamicIslandWidget(QWidget):
             p.save()
             clip = QPainterPath()
             clip.addRoundedRect(art_r, 7.0, 7.0)
-            p.setClipPath(clip)
+            p.setClipPath(clip, Qt.ClipOperation.IntersectClip)
             if self._cover_hi_pix:
                 p.drawPixmap(art_r.toRect(), self._cover_hi_pix)
             else:
@@ -2114,23 +2218,22 @@ class DynamicIslandWidget(QWidget):
             p.setPen(QColor(255, 255, 255, 248))
             p.setFont(QFont("Segoe UI Variable Display", 10, QFont.Weight.Bold))
             p.drawText(
-                QRectF(cap.center().x() - 62.0, 0, 52.0, cap.height() - 2),
+                QRectF(cap.center().x() - 62.0, cap.top(), 52.0, cap.height() - 2),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
                 time.strftime("%H:%M"),
             )
             VectorIcons.draw_weather_cloud(p, QPointF(cap.center().x() + 6.0, cy), 14.0, QColor(255, 255, 255, 235), filled=True)
             p.drawText(
-                QRectF(cap.center().x() + 18.0, 0, 44.0, cap.height() - 2),
+                QRectF(cap.center().x() + 18.0, cap.top(), 44.0, cap.height() - 2),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                 f"{w_data.temp}°",
             )
 
-            # Real 5-band spectrum (bass -> treble), mirrored around the centre line
+            eq_right = self._paint_privacy_dots(p, cap.right() - 14.0, cy)
             groups = ((0, 3), (3, 8), (8, 14), (14, 21), (21, 30))
             bar_w = 3.0
             gap = 2.6
             n_bars = len(groups)
-            eq_right = cap.right() - 16.0
             eq_left = eq_right - n_bars * bar_w - (n_bars - 1) * gap
             eq_grad = QLinearGradient(QPointF(eq_left, 0), QPointF(eq_right, 0))
             eq_grad.setColorAt(0.0, accent_col)
@@ -2150,7 +2253,7 @@ class DynamicIslandWidget(QWidget):
             p.setPen(QColor(245, 158, 11, 245))
             p.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
             p.drawText(
-                QRectF(cap.left() + 36.0, 0, 48.0, cap.height() - 2),
+                QRectF(cap.left() + 36.0, cap.top(), 48.0, cap.height() - 2),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                 self.timer_label[:7],
             )
@@ -2163,18 +2266,18 @@ class DynamicIslandWidget(QWidget):
             p.drawArc(ring_r, 90 * 16, -int(ratio * 360 * 16))
 
             p.drawText(
-                QRectF(cap.left() + 104.0, 0, 46.0, cap.height() - 2),
+                QRectF(cap.left() + 104.0, cap.top(), 46.0, cap.height() - 2),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                 format_time(self.timer_remaining_sec),
             )
             p.setPen(QColor(255, 255, 255, 245))
             p.drawText(
-                QRectF(cap.right() - 102.0, 0, 50.0, cap.height() - 2),
+                QRectF(cap.right() - 102.0, cap.top(), 50.0, cap.height() - 2),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                 time.strftime("%H:%M"),
             )
             p.drawText(
-                QRectF(cap.right() - 44.0, 0, 30.0, cap.height() - 2),
+                QRectF(cap.right() - 44.0, cap.top(), 30.0, cap.height() - 2),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
                 f"{w_data.temp}°",
             )
@@ -2193,8 +2296,9 @@ class DynamicIslandWidget(QWidget):
         p.setFont(QFont("Segoe UI Variable Display", 10, QFont.Weight.Bold))
         p.drawText(cap.adjusted(0, 0, 0, -2), Qt.AlignmentFlag.AlignCenter, time.strftime("%H:%M"))
 
+        right_end = self._paint_privacy_dots(p, cap.right() - 14.0, cy)
         if self.shelf_files:
-            badge = QRectF(cap.right() - 62.0, cy - 8.5, 28.0, 17.0)
+            badge = QRectF(right_end - 56.0, cy - 8.5, 26.0, 17.0)
             p.setPen(QPen(QColor(255, 255, 255, 35), 1.0))
             p.setBrush(QColor(26, 26, 32, 255))
             p.drawRoundedRect(badge, 8.5, 8.5)
@@ -2205,7 +2309,7 @@ class DynamicIslandWidget(QWidget):
         p.setPen(QColor(255, 255, 255, 235))
         p.setFont(QFont("Segoe UI Variable Display", 10, QFont.Weight.Bold))
         p.drawText(
-            QRectF(cap.right() - 40.0, 0, 26.0, cap.height() - 2),
+            QRectF(right_end - 28.0, cap.top(), 28.0, cap.height() - 2),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
             f"{w_data.temp}°",
         )
@@ -2274,8 +2378,57 @@ class DynamicIslandWidget(QWidget):
         p.restore()
 
     def _paint_osd_pill(self, p: QPainter, cap: QRectF, accent_col: QColor):
-        cy = cap.height() * 0.48
-        if self._osd_type == "lang":
+        cy = cap.top() + cap.height() * 0.48
+        if self._osd_type == "notif":
+            # Rich Telegram / Discord / Microphone / Headphone Notification Capsule (Items 1 & 2)
+            app_low = (self._notif_app or "").lower()
+            if "telegram" in app_low:
+                b_col = QColor(42, 171, 238, 255)
+            elif "discord" in app_low:
+                b_col = QColor(88, 101, 242, 255)
+            elif "микрофон" in app_low:
+                b_col = QColor(255, 159, 10, 255)
+            elif "камера" in app_low or "аудио" in app_low:
+                b_col = QColor(48, 209, 88, 255)
+            else:
+                b_col = accent_col
+
+            ic_c = QPointF(cap.left() + 26.0, cy)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(b_col.red(), b_col.green(), b_col.blue(), 45))
+            p.drawEllipse(ic_c, 16.5, 16.5)
+            p.setBrush(b_col)
+            p.drawEllipse(ic_c, 12.5, 12.5)
+            if "микрофон" in app_low:
+                VectorIcons.draw_voice_bars(p, ic_c, 12.5, QColor(255, 255, 255, 252))
+            elif "аудио" in app_low:
+                VectorIcons.draw_speaker(p, ic_c, 12.5, QColor(255, 255, 255, 252), 0.8, False)
+            else:
+                VectorIcons.draw_location_pin(p, ic_c, 12.0, QColor(255, 255, 255, 252))
+
+            p.setPen(QColor(255, 255, 255, 252))
+            p.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+            p.drawText(
+                QRectF(cap.left() + 48.0, cap.top() + 7.0, cap.width() - 126.0, 19.0),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                self._osd_text,
+            )
+            p.setPen(QColor(175, 180, 195, 235))
+            p.setFont(QFont("Segoe UI", 8))
+            p.drawText(
+                QRectF(cap.left() + 48.0, cap.top() + 25.0, cap.width() - 126.0, 18.0),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                self._notif_subtitle or "Нажмите, чтобы открыть окно",
+            )
+
+            open_pill = QRectF(cap.right() - 72.0, cy - 12.0, 58.0, 24.0)
+            p.setPen(QPen(QColor(b_col.red(), b_col.green(), b_col.blue(), 125), 1.0))
+            p.setBrush(QColor(b_col.red(), b_col.green(), b_col.blue(), 38))
+            p.drawRoundedRect(open_pill, 12.0, 12.0)
+            p.setPen(QColor(255, 255, 255, 248))
+            p.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+            p.drawText(open_pill, Qt.AlignmentFlag.AlignCenter, "Открыть")
+        elif self._osd_type == "lang":
             badge = QRectF(cap.left() + 14.0, cy - 10.5, 34.0, 21.0)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(255, 255, 255, 245))
@@ -2287,7 +2440,7 @@ class DynamicIslandWidget(QWidget):
             p.setPen(QColor(255, 255, 255, 245))
             p.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
             p.drawText(
-                QRectF(badge.right() + 10.0, 0, cap.width() - 68.0, cap.height() - 2),
+                QRectF(badge.right() + 10.0, cap.top(), cap.width() - 68.0, cap.height() - 2),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                 f"Раскладка · {self._osd_text}",
             )
@@ -2311,7 +2464,7 @@ class DynamicIslandWidget(QWidget):
             p.setPen(QColor(255, 255, 255, 235))
             p.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
             p.drawText(
-                QRectF(bar_bg.right() + 8.0, 0, 38.0, cap.height() - 2),
+                QRectF(bar_bg.right() + 8.0, cap.top(), 38.0, cap.height() - 2),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
                 self._osd_text,
             )
@@ -2322,7 +2475,7 @@ class DynamicIslandWidget(QWidget):
 
     # --- Top 7-Tab Navigation Bar (With Pixel-Exact Font Widths so Text NEVER Clips!) ---
     def _paint_top_7tab_navbar(self, p: QPainter, cap: QRectF, accent_col: QColor):
-        ty = 12.0
+        ty = cap.top() + 12.0
         tx = cap.left() + 22.0
 
         tabs = [
@@ -2362,7 +2515,7 @@ class DynamicIslandWidget(QWidget):
 
             if open_t > 0.12:
                 p.save()
-                p.setClipRect(r.adjusted(26, 0, -4, 0))
+                p.setClipRect(r.adjusted(26, 0, -4, 0), Qt.ClipOperation.IntersectClip)
                 p.setOpacity(clamp((open_t - 0.12) / 0.72))
                 p.setPen(QColor(255, 255, 255, 252))
                 p.setFont(tab_font)
@@ -2449,7 +2602,7 @@ class DynamicIslandWidget(QWidget):
         )
         if pill_open > 0.15:
             p.save()
-            p.setClipRect(urect.adjusted(24, 0, -4, 0))
+            p.setClipRect(urect.adjusted(24, 0, -4, 0), Qt.ClipOperation.IntersectClip)
             p.setOpacity(clamp((pill_open - 0.15) / 0.7))
             p.setPen(QColor(255, 255, 255, 252))
             p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
@@ -2498,7 +2651,7 @@ class DynamicIslandWidget(QWidget):
         p_path.addRoundedRect(p_card, 18.0, 18.0)
 
         p.save()
-        p.setClipPath(p_path)
+        p.setClipPath(p_path, Qt.ClipOperation.IntersectClip)
 
         # Orbiting 3-Blob Animated Aurora Mesh behind Album Cover (Always colorful!)
         r2, g2, b2 = track.secondary_color
@@ -2621,7 +2774,8 @@ class DynamicIslandWidget(QWidget):
 
             aclip = QPainterPath()
             aclip.addRoundedRect(art_r, 16.0, 16.0)
-            p.setClipPath(aclip)
+            p.save()
+            p.setClipPath(aclip, Qt.ClipOperation.IntersectClip)
             if self._cover_hi_pix:
                 p.drawPixmap(art_r.toRect(), self._cover_hi_pix)
             else:
@@ -2632,7 +2786,7 @@ class DynamicIslandWidget(QWidget):
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QColor(255, 225, 165, 235))
                 p.drawEllipse(QPointF(art_c.x(), art_c.y() + 2.0), 21.0, 21.0)
-            p.setClipping(False)
+            p.restore()
             p.setPen(QPen(QColor(255, 255, 255, 42), 1.1))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRoundedRect(art_r, 16.0, 16.0)
@@ -3414,7 +3568,7 @@ class DynamicIslandWidget(QWidget):
         sky_path.addRoundedRect(sky_card, 18.0, 18.0)
 
         p.save()
-        p.setClipPath(sky_path)
+        p.setClipPath(sky_path, Qt.ClipOperation.IntersectClip)
         # Multi-stop deep twilight sky gradient
         sky_grad = QLinearGradient(sky_card.topLeft(), sky_card.bottomRight())
         sky_grad.setColorAt(0.0, QColor(24, 38, 72, 255))
@@ -3891,7 +4045,7 @@ class DynamicIslandWidget(QWidget):
         u_clip = QPainterPath()
         u_clip.addRoundedRect(u_card, 20.0, 20.0)
         p.save()
-        p.setClipPath(u_clip)
+        p.setClipPath(u_clip, Qt.ClipOperation.IntersectClip)
 
         # Ambient dual-aurora backdrop glow inside Update Studio
         breathe = 0.5 + 0.5 * math.sin(self._aurora_phase * 2.0)
@@ -3935,17 +4089,17 @@ class DynamicIslandWidget(QWidget):
 
         # App Title & Version Transition Pill
         p.setPen(QColor(255, 255, 255, 252))
-        p.setFont(QFont("Segoe UI Variable Display", 16, QFont.Weight.Bold))
+        p.setFont(QFont("Segoe UI Variable Display", 15, QFont.Weight.Bold))
         p.drawText(
-            QRectF(u_card.left(), u_card.top() + 114.0, w, 28.0),
+            QRectF(u_card.left(), u_card.top() + 108.0, w, 26.0),
             Qt.AlignmentFlag.AlignCenter,
             f"Island  v{self.updater.local_version}",
         )
 
-        status_pill = QRectF(cx_u - 118.0, u_card.top() + 148.0, 236.0, 28.0)
+        status_pill = QRectF(cx_u - 118.0, u_card.top() + 138.0, 236.0, 26.0)
         p.setPen(QPen(accent_col if has_upd else QColor(74, 222, 128, 120), 1.1))
         p.setBrush(QColor(42, 20, 32, 210) if has_upd else QColor(18, 38, 28, 195))
-        p.drawRoundedRect(status_pill, 14.0, 14.0)
+        p.drawRoundedRect(status_pill, 13.0, 13.0)
         p.setPen(QColor(255, 228, 238) if has_upd else QColor(167, 243, 208))
         p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         p.drawText(
@@ -3954,8 +4108,8 @@ class DynamicIslandWidget(QWidget):
             f"Доступна новая сборка  v{self.updater.remote_version}" if has_upd else "Установлена актуальная версия",
         )
 
-        # Centerpiece Hero 'Обновить' Button (264 x 54 px)
-        act_btn = QRectF(cx_u - 132.0, u_card.top() + 196.0, 264.0, 54.0)
+        # Centerpiece Hero 'Обновить' Button (264 x 52 px)
+        act_btn = QRectF(cx_u - 132.0, u_card.top() + 176.0, 264.0, 52.0)
         if has_upd:
             self._hitboxes["btn_github_update"] = act_btn
             hu, pu = self._get_btn_springs("btn_github_update")
@@ -3990,7 +4144,7 @@ class DynamicIslandWidget(QWidget):
 
             # Top glass reflection + animated diagonal light sheen
             p.save()
-            p.setClipPath(btn_path)
+            p.setClipPath(btn_path, Qt.ClipOperation.IntersectClip)
             gloss = QLinearGradient(act_btn.topLeft(), act_btn.bottomLeft())
             gloss.setColorAt(0.0, QColor(255, 255, 255, 82))
             gloss.setColorAt(0.48, QColor(255, 255, 255, 0))
@@ -4060,9 +4214,34 @@ class DynamicIslandWidget(QWidget):
                 label,
             )
 
+        # Item 6 & Item 1/2: 4-Pill Island Appearance & Live Notification Bar
+        float_lbl = "Форма: Парящая" if self.consent_mgr.island_float_mode == 1 else "Форма: Вырез"
+        wave_names = {0: "Волна: Неон", 1: "Волна: Мягкая", 2: "Волна: Выкл"}
+        bass_names = {0: "Бас: 100%", 1: "Бас: 155% +", 2: "Бас: 65%"}
+        style_pills = [
+            ("btn_style_float", float_lbl),
+            ("btn_style_wave", wave_names.get(self.consent_mgr.wave_style_mode, "Волна: Неон")),
+            ("btn_style_bass", bass_names.get(self.consent_mgr.bass_sens_mode, "Бас: 100%")),
+            ("btn_test_notif", "Тест уведомления"),
+        ]
+        sp_w_item = 152.0
+        sp_gap = 10.0
+        sp_start_x = cx_u - (4 * sp_w_item + 3 * sp_gap) * 0.5
+        sp_y = u_card.bottom() - 88.0
+        for s_idx, (s_key, s_lbl) in enumerate(style_pills):
+            s_rect = QRectF(sp_start_x + s_idx * (sp_w_item + sp_gap), sp_y, sp_w_item, 30.0)
+            self._hitboxes[s_key] = s_rect
+            hs, _ = self._get_btn_springs(s_key)
+            p.setPen(QPen(QColor(142, 162, 255, int(lerp(35, 110, hs.value))), 1.0))
+            p.setBrush(QColor(int(lerp(24, 34, hs.value)), int(lerp(25, 35, hs.value)), int(lerp(34, 46, hs.value)), 240))
+            p.drawRoundedRect(s_rect, 10.5, 10.5)
+            p.setPen(QColor(238, 240, 250, 248))
+            p.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+            p.drawText(s_rect, Qt.AlignmentFlag.AlignCenter, s_lbl)
+
         # Symmetrical Bottom Legal Pills ('Политика конфиденциальности' & 'Пользовательское соглашение')
-        btn_priv = QRectF(cx_u - 216.0, u_card.bottom() - 48.0, 208.0, 32.0)
-        btn_cons = QRectF(cx_u + 8.0, u_card.bottom() - 48.0, 208.0, 32.0)
+        btn_priv = QRectF(cx_u - 216.0, u_card.bottom() - 46.0, 208.0, 30.0)
+        btn_cons = QRectF(cx_u + 8.0, u_card.bottom() - 46.0, 208.0, 30.0)
         self._hitboxes["btn_open_privacy"] = btn_priv
         self._hitboxes["btn_open_consent"] = btn_cons
 
