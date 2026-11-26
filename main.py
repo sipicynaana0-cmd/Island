@@ -85,6 +85,10 @@ def main():
 
     island = DynamicIslandWidget(media, audio, telemetry)
     island.show()
+    try:
+        telemetry.set_own_hwnd(int(island.winId()))
+    except Exception:
+        pass
 
     # System Tray Setup
     tray = QSystemTrayIcon(app_icon, app)
@@ -120,12 +124,24 @@ def main():
 
     act_expand = QAction("Раскрыть / Закрепить остров", menu)
     def _on_toggle_expand():
+        if island.game_hide_state == "hidden_arrow":
+            island._game_summoned_override = True
+            island._start_eyes_reveal()
+            return
         island.is_pinned_open = not island.is_pinned_open
         island.is_hovered = island.is_pinned_open
         island._update_target_dimensions()
         island._ensure_anim_running()
     act_expand.triggered.connect(_on_toggle_expand)
     menu.addAction(act_expand)
+
+    act_eyes = QAction("Появление через глазки", menu)
+    def _on_eyes_reveal():
+        island._hide_to_game_arrow()
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(260, island._start_eyes_reveal)
+    act_eyes.triggered.connect(_on_eyes_reveal)
+    menu.addAction(act_eyes)
 
     act_standby = QAction("Скриншот области экрана", menu)
     act_standby.triggered.connect(island.snip_overlay.start_capture)
