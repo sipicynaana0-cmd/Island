@@ -1358,8 +1358,9 @@ class DynamicIslandWidget(QWidget):
                 self._is_blinking = False
                 self._blink_timer = random.uniform(-0.8, 0.4)
 
-        self._wave_phase = (self._wave_phase + dt * (1.2 + peak * 18.0 if track.is_playing else 0.0)) % (math.pi * 40.0)
-        self._aurora_phase = (self._aurora_phase + dt * (0.8 + peak * 2.4 if track.is_playing else 0.45)) % (math.pi * 20.0)
+        pk_now = self.audio._smooth_peak
+        self._wave_phase = (self._wave_phase + dt * (1.2 + pk_now * 18.0 if track.is_playing else 0.0)) % (math.pi * 40.0)
+        self._aurora_phase = (self._aurora_phase + dt * (0.8 + pk_now * 2.4 if track.is_playing else 0.45)) % (math.pi * 20.0)
         if track.is_playing:
             self._vinyl_angle = (self._vinyl_angle + 88.0 * dt) % 360.0
         if track.title:
