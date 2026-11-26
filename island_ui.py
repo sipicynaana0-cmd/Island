@@ -1597,9 +1597,9 @@ class DynamicIslandWidget(QWidget):
             self.tab_open_sp[i].set_target(1.0 if i == self.active_tab else 0.0)
 
         if updating_now:
-            self.sp_w.set_target(384.0, stiffness=400.0, damping=40.0)
-            self.sp_h.set_target(58.0, stiffness=400.0, damping=40.0)
-            self.sp_r.set_target(24.0)
+            self.sp_w.set_target(336.0, stiffness=400.0, damping=40.0)
+            self.sp_h.set_target(44.0, stiffness=400.0, damping=40.0)
+            self.sp_r.set_target(22.0)
             self.sp_expand.set_target(0.0)
         elif expanded:
             self.sp_w.set_target(self.EXPANDED_W, stiffness=420.0, damping=41.0)
@@ -1608,18 +1608,18 @@ class DynamicIslandWidget(QWidget):
             self.sp_expand.set_target(1.0)
         elif osd_active:
             if self._osd_type in ("notif", "usb", "usb_out"):
-                self.sp_w.set_target(392.0, stiffness=420.0, damping=41.0)
-                self.sp_h.set_target(60.0, stiffness=420.0, damping=41.0)
+                self.sp_w.set_target(368.0, stiffness=420.0, damping=41.0)
+                self.sp_h.set_target(54.0, stiffness=420.0, damping=41.0)
                 self.sp_r.set_target(24.0)
             else:
-                self.sp_w.set_target(286.0, stiffness=420.0, damping=41.0)
-                self.sp_h.set_target(40.0, stiffness=420.0, damping=41.0)
-                self.sp_r.set_target(20.0)
+                self.sp_w.set_target(274.0, stiffness=420.0, damping=41.0)
+                self.sp_h.set_target(38.0, stiffness=420.0, damping=41.0)
+                self.sp_r.set_target(19.0)
             self.sp_expand.set_target(0.0)
         elif self._active_download is not None:
-            # Feature #11 & #3: Live Steam / Browser Download Capsule
-            self.sp_w.set_target(374.0, stiffness=400.0, damping=40.0)
-            self.sp_h.set_target(54.0, stiffness=400.0, damping=40.0)
+            # Sleek Apple Live Activity Download Pill (compact 44px height, generous corner margins!)
+            self.sp_w.set_target(336.0, stiffness=400.0, damping=40.0)
+            self.sp_h.set_target(44.0, stiffness=400.0, damping=40.0)
             self.sp_r.set_target(22.0)
             self.sp_expand.set_target(0.0)
         elif is_music_playing:
@@ -2971,128 +2971,112 @@ class DynamicIslandWidget(QWidget):
                 # Fade-in of actual Island content during Stage 3 (1.22..1.72)
                 p.setOpacity(clamp((el - 1.22) / 0.42))
 
-        # 3. Living Plasma Update Download Capsule (when user clicks 'Обновить'!)
+        # 3. Clean Minimalist Apple-Style OTA Update Progress Pill (Zero neon smears, strict safe insets!)
         if self.is_updating_collapse or self.updater.status in ("downloading", "updated"):
-            prog = clamp(self.sp_update_prog.value, 0.03, 1.0)
+            if cap.width() < 210.0:
+                return
+            prog = clamp(self.sp_update_prog.value, 0.02, 1.0)
             pct = int(round(prog * 100))
             done_flash = self.updater.status == "updated"
-            bar_col = QColor(74, 222, 128) if done_flash else accent_col
 
-            # Ambient pulse aura inside loading capsule
-            aura = QRadialGradient(QPointF(cap.left() + 26.0 + prog * (cap.width() - 52.0), cap.bottom() - 14.0), 85.0)
-            aura.setColorAt(0.0, QColor(bar_col.red(), bar_col.green(), bar_col.blue(), 65))
-            aura.setColorAt(1.0, QColor(0, 0, 0, 0))
-            p.fillRect(cap, QBrush(aura))
-
-            # Dual counter-rotating orbital rings on the left
-            ic_pt = QPointF(cap.left() + 24.0, cap.top() + 20.0)
-            p.setPen(QPen(QColor(bar_col.red(), bar_col.green(), bar_col.blue(), 90), 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            # Left: crisp 20x20 circular progress ring strictly clear of curved corners
+            ring_c = QPointF(cap.left() + 26.0, cy)
+            ring_r = QRectF(ring_c.x() - 10.0, ring_c.y() - 10.0, 20.0, 20.0)
+            p.setPen(QPen(QColor(46, 46, 52, 255), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             p.setBrush(Qt.BrushStyle.NoBrush)
-            ang1 = int(((self._aurora_phase * 220.0) % 360.0) * 16)
-            ang2 = int(((-self._aurora_phase * 160.0) % 360.0) * 16)
-            p.drawArc(QRectF(ic_pt.x() - 10.0, ic_pt.y() - 10.0, 20.0, 20.0), ang1, 220 * 16)
-            p.setPen(QPen(QColor(142, 162, 255, 195), 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            p.drawArc(QRectF(ic_pt.x() - 6.5, ic_pt.y() - 6.5, 13.0, 13.0), ang2, 190 * 16)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(bar_col)
-            p.drawEllipse(ic_pt, 2.4, 2.4)
+            p.drawEllipse(ring_r)
+            arc_col = QColor(48, 209, 88, 255) if done_flash else QColor(255, 255, 255, 248)
+            p.setPen(QPen(arc_col, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawArc(ring_r, 90 * 16, -int(prog * 360.0 * 16))
+            VectorIcons.draw_download_arrow(p, ring_c, 9.0, arc_col)
 
-            p.setPen(QColor(255, 255, 255, 250))
-            p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+            # Center: clean single-line status text strictly elided inside safe margins
+            t_font = QFont("Segoe UI", 9, QFont.Weight.DemiBold)
+            p.setFont(t_font)
+            p.setPen(QColor(245, 245, 247, 250))
+            avail_w = max(40, int(cap.width() - 106.0))
+            st_txt = QFontMetrics(t_font).elidedText(self.updater.status_text or "Обновление...", Qt.TextElideMode.ElideRight, avail_w)
             p.drawText(
-                QRectF(cap.left() + 42.0, cap.top() + 9.0, cap.width() - 100.0, 20.0),
+                QRectF(cap.left() + 46.0, cap.top(), float(avail_w), cap.height()),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                self.updater.status_text,
+                st_txt,
             )
 
-            p.setPen(bar_col)
-            p.setFont(QFont("Segoe UI Variable Display", 10, QFont.Weight.Bold))
+            # Right: clean tabular percentage
+            p.setPen(QColor(48, 209, 88, 255) if done_flash else QColor(174, 174, 182, 245))
+            p.setFont(QFont("Segoe UI Variable Display", 9, QFont.Weight.Bold))
             p.drawText(
-                QRectF(cap.right() - 58.0, cap.top() + 9.0, 40.0, 20.0),
+                QRectF(cap.right() - 62.0, cap.top(), 40.0, cap.height()),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
                 f"{pct}%",
             )
-
-            # Plasma Liquid Progress Bar with glowing comet head & floating sparks
-            bar_bg = QRectF(cap.left() + 18.0, cap.bottom() - 16.0, cap.width() - 36.0, 7.0)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(26, 26, 34, 255))
-            p.drawRoundedRect(bar_bg, 3.5, 3.5)
-
-            fill_w = max(10.0, bar_bg.width() * prog)
-            fill_r = QRectF(bar_bg.left(), bar_bg.top(), fill_w, bar_bg.height())
-            p_grad = QLinearGradient(fill_r.topLeft(), fill_r.topRight())
-            if done_flash:
-                p_grad.setColorAt(0.0, QColor(52, 211, 153))
-                p_grad.setColorAt(1.0, QColor(167, 243, 208))
-            else:
-                p_grad.setColorAt(0.0, accent_col)
-                p_grad.setColorAt(0.55, QColor(244, 114, 182, 255))
-                p_grad.setColorAt(1.0, QColor(142, 162, 255, 255))
-            p.setBrush(QBrush(p_grad))
-            p.drawRoundedRect(fill_r, 3.5, 3.5)
-
-            # Traveling specular sheen inside progress bar + bright comet tip
-            head_x = fill_r.right()
-            comet_g = QRadialGradient(QPointF(head_x, fill_r.center().y()), 14.0)
-            comet_g.setColorAt(0.0, QColor(255, 255, 255, 245))
-            comet_g.setColorAt(0.45, QColor(bar_col.red(), bar_col.green(), bar_col.blue(), 155))
-            comet_g.setColorAt(1.0, QColor(0, 0, 0, 0))
-            p.setBrush(QBrush(comet_g))
-            p.drawEllipse(QPointF(head_x, fill_r.center().y()), 14.0, 9.0)
-            p.setBrush(QColor(255, 255, 255, 255))
-            p.drawEllipse(QPointF(head_x - 2.0, fill_r.center().y()), 2.6, 2.6)
             return
 
-        # 3.5 Live Steam / Browser Download Capsule (Features #11 & #3 — Rust multi-library scanner!)
+        # 3.5 Clean Apple-Style Live Download Pill (Steam / Browser — Circular Ring, Zero Smears, Strict Safe Margins!)
         if self._active_download is not None:
+            if cap.width() < 220.0:
+                return
             dl = self._active_download
-            is_steam = dl.get("source") == "steam"
             dl_name = str(dl.get("name", "Загрузка"))
             dl_pct = float(dl.get("pct", -1.0))
             dl_mbps = float(dl.get("mbps", 0.0))
             dl_mb = float(dl.get("mb_done", 0.0))
-            dl_col = QColor(56, 189, 248) if is_steam else QColor(52, 211, 153)
 
-            aura_dl = QRadialGradient(QPointF(cap.left() + 34.0, cy), 95.0)
-            aura_dl.setColorAt(0.0, QColor(dl_col.red(), dl_col.green(), dl_col.blue(), 58))
-            aura_dl.setColorAt(1.0, QColor(0, 0, 0, 0))
-            p.fillRect(cap, QBrush(aura_dl))
+            # Left: clean monochrome dark-glass 24x24 icon box safely inset 22px from curve
+            ic_r = QRectF(cap.left() + 22.0, cy - 12.0, 24.0, 24.0)
+            p.setPen(QPen(QColor(255, 255, 255, 22), 1.0))
+            p.setBrush(QColor(24, 24, 29, 255))
+            p.drawRoundedRect(ic_r, 7.5, 7.5)
+            VectorIcons.draw_download_arrow(p, ic_r.center(), 12.0, QColor(242, 242, 247, 245))
 
-            ic_pt = QPointF(cap.left() + 24.0, cap.top() + 20.0)
-            p.setPen(QPen(QColor(dl_col.red(), dl_col.green(), dl_col.blue(), 110), 1.3))
-            p.setBrush(QColor(18, 24, 34, 245))
-            p.drawEllipse(ic_pt, 11.0, 11.0)
-            VectorIcons.draw_download_arrow(p, ic_pt, 12.0, dl_col)
-
-            tag_s = "STEAM" if is_steam else "ЗАГРУЗКА"
-            t_f = QFont("Segoe UI", 8, QFont.Weight.Bold)
-            p.setFont(t_f)
-            p.setPen(QColor(250, 252, 255, 250))
-            lbl_s = QFontMetrics(t_f).elidedText(f"{tag_s} · {dl_name}", Qt.TextElideMode.ElideRight, int(cap.width() - 145))
-            p.drawText(QRectF(cap.left() + 42.0, cap.top() + 8.0, cap.width() - 140.0, 20.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, lbl_s)
-
-            spd_txt = f"{dl_mbps:.1f} МБ/с" if dl_mbps >= 0.1 else (f"{dl_mb:.0f} МБ" if dl_mb > 0.5 else "Загрузка")
-            right_txt = f"{int(round(dl_pct))}% · {spd_txt}" if dl_pct >= 0.0 else spd_txt
-            p.setPen(dl_col)
-            p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-            p.drawText(QRectF(cap.right() - 118.0, cap.top() + 8.0, 102.0, 20.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, right_txt)
-
-            bar_bg = QRectF(cap.left() + 18.0, cap.bottom() - 14.0, cap.width() - 36.0, 5.5)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(28, 30, 38, 255))
-            p.drawRoundedRect(bar_bg, 2.75, 2.75)
+            # Right: authentic iOS Circular Progress Ring (20x20) + clean percentage strictly inset 22px
+            ring_c = QPointF(cap.right() - 32.0, cy)
+            ring_r = QRectF(ring_c.x() - 10.0, ring_c.y() - 10.0, 20.0, 20.0)
+            p.setPen(QPen(QColor(46, 46, 52, 255), 2.1, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(ring_r)
+            p.setPen(QPen(QColor(255, 255, 255, 245), 2.1, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             if dl_pct >= 0.0:
-                fw = max(8.0, bar_bg.width() * clamp(dl_pct / 100.0))
-                p.setBrush(dl_col)
-                p.drawRoundedRect(QRectF(bar_bg.left(), bar_bg.top(), fw, bar_bg.height()), 2.75, 2.75)
+                p.drawArc(ring_r, 90 * 16, -int(clamp(dl_pct / 100.0, 0.02, 1.0) * 360.0 * 16))
             else:
-                # Smooth indeterminate plasma sweep for browser download
-                sw_t = (self._aurora_phase * 0.45) % 1.0
-                sw_w = bar_bg.width() * 0.34
-                sw_x = bar_bg.left() + sw_t * (bar_bg.width() - sw_w)
-                p.setBrush(dl_col)
-                p.drawRoundedRect(QRectF(sw_x, bar_bg.top(), sw_w, bar_bg.height()), 2.75, 2.75)
+                ang_spin = int(((-self._aurora_phase * 210.0) % 360.0) * 16)
+                p.drawArc(ring_r, ang_spin, 110 * 16)
+
+            pct_txt = f"{int(round(dl_pct))}%" if dl_pct >= 0.0 else ""
+            pct_w = 34.0 if pct_txt else 0.0
+            if pct_txt:
+                p.setPen(QColor(229, 229, 234, 245))
+                p.setFont(QFont("Segoe UI Variable Display", 8, QFont.Weight.Bold))
+                p.drawText(
+                    QRectF(ring_r.left() - 38.0, cap.top(), 32.0, cap.height()),
+                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                    pct_txt,
+                )
+
+            # Center: crisp 2-line title + quiet speed strictly clipped between icon & ring!
+            text_left = ic_r.right() + 10.0
+            text_right = ring_r.left() - pct_w - 8.0
+            text_w = max(40.0, text_right - text_left)
+
+            t_f = QFont("Segoe UI", 8, QFont.Weight.DemiBold)
+            s_f = QFont("Segoe UI", 7, QFont.Weight.Medium)
+            p.setFont(t_f)
+            p.setPen(QColor(245, 245, 247, 250))
+            el_name = QFontMetrics(t_f).elidedText(dl_name, Qt.TextElideMode.ElideRight, int(text_w))
+            p.drawText(
+                QRectF(text_left, cap.top() + 6.0, text_w, 16.0),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                el_name,
+            )
+
+            spd_txt = f"{dl_mbps:.1f} МБ/с" if dl_mbps >= 0.1 else (f"{dl_mb:.0f} МБ" if dl_mb > 0.5 else "Загрузка...")
+            p.setFont(s_f)
+            p.setPen(QColor(142, 142, 147, 235))
+            p.drawText(
+                QRectF(text_left, cap.top() + 22.0, text_w, 14.0),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                spd_txt,
+            )
             return
 
         # 4. Sleek Music Folded Capsule (ONLY when music is actively playing! When paused/idle -> Living 2 Eyes!)
@@ -3344,98 +3328,78 @@ class DynamicIslandWidget(QWidget):
         p.restore()
 
     def _paint_osd_pill(self, p: QPainter, cap: QRectF, accent_col: QColor):
-        cy = cap.top() + cap.height() * 0.48
+        cy = cap.top() + cap.height() * 0.49
         if self._osd_type in ("notif", "usb", "usb_out"):
-            # Upgraded Brand-Authentic Rich Notification & USB Live Activity Capsule!
+            if cap.width() < 240.0:
+                return
+            # Authentic Minimalist Apple Notification / USB Banner (Pure #000000, zero muddy radial blurs!)
             app_low = (self._notif_app or "").lower()
             if self._osd_type == "usb":
-                b_col, b_col2, tag_txt = QColor(52, 211, 153), QColor(16, 185, 129), "USB НАКОПИТЕЛЬ"
-                ic_fn = VectorIcons.draw_shelf_box
+                b_col, ic_fn = QColor(48, 209, 88), VectorIcons.draw_shelf_box
             elif self._osd_type == "usb_out":
-                b_col, b_col2, tag_txt = QColor(148, 163, 184), QColor(100, 116, 139), "USB ОТКЛЮЧЁН"
-                ic_fn = VectorIcons.draw_shelf_box
+                b_col, ic_fn = QColor(99, 99, 108), VectorIcons.draw_shelf_box
             elif "telegram" in app_low:
-                b_col, b_col2, tag_txt = QColor(55, 174, 226), QColor(30, 150, 200), "TELEGRAM"
-                ic_fn = VectorIcons.draw_telegram
+                b_col, ic_fn = QColor(42, 171, 238), VectorIcons.draw_telegram
             elif "discord" in app_low:
-                b_col, b_col2, tag_txt = QColor(88, 101, 242), QColor(71, 82, 196), "DISCORD"
-                ic_fn = VectorIcons.draw_discord
+                b_col, ic_fn = QColor(88, 101, 242), VectorIcons.draw_discord
             elif "микрофон" in app_low:
-                b_col, b_col2, tag_txt = QColor(255, 159, 10), QColor(234, 88, 12), "МИКРОФОН"
-                ic_fn = VectorIcons.draw_microphone
+                b_col, ic_fn = QColor(255, 159, 10), VectorIcons.draw_microphone
             elif "аудио" in app_low:
-                b_col, b_col2, tag_txt = QColor(48, 209, 88), QColor(16, 185, 129), "АУДИО"
-                ic_fn = VectorIcons.draw_headphones
+                b_col, ic_fn = QColor(48, 209, 88), VectorIcons.draw_headphones
             else:
-                b_col, b_col2, tag_txt = accent_col, QColor(142, 162, 255), (self._notif_app or "ISLAND").upper()[:10]
-                ic_fn = VectorIcons.draw_sparkle
+                b_col, ic_fn = QColor(58, 58, 66), VectorIcons.draw_sparkle
 
-            # Soft radial brand aura radiating from the left icon
-            aura_n = QRadialGradient(QPointF(cap.left() + 30.0, cy), 120.0)
-            aura_n.setColorAt(0.0, QColor(b_col.red(), b_col.green(), b_col.blue(), 82 if self._notif_hovered else 64))
-            aura_n.setColorAt(1.0, QColor(0, 0, 0, 0))
-            p.fillRect(cap, QBrush(aura_n))
-
-            ic_c = QPointF(cap.left() + 28.0, cy - 1.0)
+            # Left: crisp solid 28x28 rounded squircle icon strictly inset 22px from curved border
+            ic_r = QRectF(cap.left() + 22.0, cy - 14.0, 28.0, 28.0)
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(b_col.red(), b_col.green(), b_col.blue(), 42))
-            p.drawEllipse(ic_c, 18.0, 18.0)
-            ic_grad = QLinearGradient(QPointF(ic_c.x() - 14, ic_c.y() - 14), QPointF(ic_c.x() + 14, ic_c.y() + 14))
-            ic_grad.setColorAt(0.0, b_col)
-            ic_grad.setColorAt(1.0, b_col2)
-            p.setBrush(QBrush(ic_grad))
-            p.drawEllipse(ic_c, 14.0, 14.0)
-            ic_fn(p, ic_c, 14.5, QColor(255, 255, 255, 255))
+            p.setBrush(b_col)
+            p.drawRoundedRect(ic_r, 8.5, 8.5)
+            ic_fn(p, ic_r.center(), 14.5, QColor(255, 255, 255, 252))
 
-            # Top meta row: brand badge + "сейчас"
-            p.setPen(b_col)
-            p.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
-            p.drawText(
-                QRectF(cap.left() + 52.0, cap.top() + 6.0, 165.0, 13.0),
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                f"{tag_txt} · сейчас",
-            )
+            # Right: clean neutral Apple glass 'Открыть' pill strictly inset 20px from curved border
+            right_margin = 20.0
+            btn_w = 64.0 if self._osd_type != "usb_out" else 0.0
+            if self._osd_type != "usb_out":
+                open_pill = QRectF(cap.right() - right_margin - btn_w, cy - 13.0, btn_w, 26.0)
+                p.setPen(QPen(QColor(255, 255, 255, 58 if self._notif_hovered else 24), 1.0))
+                p.setBrush(QColor(46, 46, 54, 255) if self._notif_hovered else QColor(28, 28, 34, 255))
+                p.drawRoundedRect(open_pill, 13.0, 13.0)
+                p.setPen(QColor(255, 255, 255, 252))
+                p.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+                p.drawText(open_pill, Qt.AlignmentFlag.AlignCenter, "Открыть")
 
-            # Main title & subtitle (elided cleanly so text never overlaps 'Открыть' pill)
-            avail_w = max(80, int(cap.width() - 138.0))
-            t_font = QFont("Segoe UI", 9, QFont.Weight.Bold)
+            # Center: crisp natural 2-line Apple typography (NO loud ALL CAPS tags!)
+            text_left = ic_r.right() + 11.0
+            text_right = cap.right() - right_margin - btn_w - (10.0 if btn_w > 0 else 4.0)
+            avail_w = max(60, int(text_right - text_left))
+            t_font = QFont("Segoe UI", 9, QFont.Weight.DemiBold)
             s_font = QFont("Segoe UI", 8)
             title_elided = QFontMetrics(t_font).elidedText(self._osd_text, Qt.TextElideMode.ElideRight, avail_w)
             sub_elided = QFontMetrics(s_font).elidedText(
                 self._notif_subtitle or "Нажмите, чтобы открыть", Qt.TextElideMode.ElideRight, avail_w
             )
-            p.setPen(QColor(255, 255, 255, 252))
+            p.setPen(QColor(245, 245, 247, 252))
             p.setFont(t_font)
             p.drawText(
-                QRectF(cap.left() + 52.0, cap.top() + 18.0, float(avail_w), 18.0),
+                QRectF(text_left, cap.top() + 9.0, float(avail_w), 17.0),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                 title_elided,
             )
-            p.setPen(QColor(175, 180, 198, 235))
+            p.setPen(QColor(142, 142, 147, 240))
             p.setFont(s_font)
             p.drawText(
-                QRectF(cap.left() + 52.0, cap.top() + 35.0, float(avail_w), 16.0),
+                QRectF(text_left, cap.top() + 27.0, float(avail_w), 16.0),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                 sub_elided,
             )
 
-            # Interactive 'Открыть' pill button (glows brightly on hover!)
-            if self._osd_type != "usb_out":
-                open_pill = QRectF(cap.right() - 76.0, cy - 13.5, 62.0, 26.0)
-                p.setPen(QPen(QColor(b_col.red(), b_col.green(), b_col.blue(), 240 if self._notif_hovered else 145), 1.2 if self._notif_hovered else 1.0))
-                p.setBrush(QColor(b_col.red(), b_col.green(), b_col.blue(), 110 if self._notif_hovered else 48))
-                p.drawRoundedRect(open_pill, 13.0, 13.0)
-                p.setPen(QColor(255, 255, 255, 255))
-                p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-                p.drawText(open_pill, Qt.AlignmentFlag.AlignCenter, "Открыть")
-
-            # Smooth shrinking countdown hairline along the bottom edge
+            # Ultra-subtle white countdown hairline strictly inset 36px from BOTH sides (never touches corners!)
             rem_ratio = clamp((self._osd_until - time.monotonic()) / max(0.3, self._osd_duration), 0.0, 1.0)
-            cd_w = (cap.width() - 48.0) * rem_ratio
+            cd_w = max(0.0, (cap.width() - 72.0) * rem_ratio)
             if cd_w > 2.0:
                 p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QColor(b_col.red(), b_col.green(), b_col.blue(), 195))
-                p.drawRoundedRect(QRectF(cap.left() + 24.0, cap.bottom() - 4.0, cd_w, 2.2), 1.1, 1.1)
+                p.setBrush(QColor(255, 255, 255, 58))
+                p.drawRoundedRect(QRectF(cap.left() + 36.0, cap.bottom() - 5.0, cd_w, 1.5), 0.75, 0.75)
         elif self._osd_type == "caps":
             is_on = "ВКЛ" in self._osd_text
             badge = QRectF(cap.left() + 14.0, cy - 10.5, 42.0, 21.0)
@@ -5228,14 +5192,14 @@ class DynamicIslandWidget(QWidget):
             )
             return
 
-        # Centered Luxury Update Studio Card (No text wall of release notes, pure sculpted UI & hero Update button!)
+        # Pure Timeless macOS/Apple Minimalist Software Update Card (Zero AI radial blurs, zero sci-fi rings, zero sparkles!)
         has_upd = self.updater.update_available
         u_card = self._draw_obsidian_card(
             p,
             QRectF(left_x, top, w, 342.0),
             20.0,
             cascade_order=0,
-            active_border=QColor(accent_col.red(), accent_col.green(), accent_col.blue(), 115) if has_upd else None,
+            active_border=QColor(255, 255, 255, 26) if has_upd else None,
         )
 
         u_clip = QPainterPath()
@@ -5243,217 +5207,84 @@ class DynamicIslandWidget(QWidget):
         p.save()
         p.setClipPath(u_clip, Qt.ClipOperation.IntersectClip)
 
-        # Ambient dual-aurora backdrop glow + drifting starlight dust inside Update Studio
-        breathe = 0.5 + 0.5 * math.sin(self._aurora_phase * 2.1)
         cx_u = u_card.center().x()
-        orb_pt = QPointF(cx_u, u_card.top() + 76.0)
 
-        bg_glow = QRadialGradient(orb_pt, 225.0)
-        if has_upd:
-            bg_glow.setColorAt(0.0, QColor(accent_col.red(), accent_col.green(), accent_col.blue(), int(86 + 26 * breathe)))
-            bg_glow.setColorAt(0.48, QColor(142, 162, 255, int(34 + 14 * breathe)))
-            bg_glow.setColorAt(1.0, QColor(12, 12, 18, 0))
-        else:
-            bg_glow.setColorAt(0.0, QColor(74, 222, 128, int(62 + 22 * breathe)))
-            bg_glow.setColorAt(0.50, QColor(56, 189, 248, int(24 + 10 * breathe)))
-            bg_glow.setColorAt(1.0, QColor(12, 12, 18, 0))
-        p.fillRect(u_card, QBrush(bg_glow))
-
-        # Living drifting starlight particles (zero-alloc deterministic trigonometry)
+        # Sculpted Monochrome Island App Emblem (56x56 macOS-style dark squircle)
+        emb_r = QRectF(cx_u - 28.0, u_card.top() + 34.0, 56.0, 56.0)
+        emb_grad = QLinearGradient(emb_r.topLeft(), emb_r.bottomLeft())
+        emb_grad.setColorAt(0.0, QColor(34, 34, 42, 255))
+        emb_grad.setColorAt(1.0, QColor(18, 18, 23, 255))
+        p.setPen(QPen(QColor(255, 255, 255, 30), 1.0))
+        p.setBrush(QBrush(emb_grad))
+        p.drawRoundedRect(emb_r, 15.0, 15.0)
+        # Minimal black Island capsule silhouette inside emblem
+        mini_pill = QRectF(emb_r.center().x() - 16.0, emb_r.center().y() - 7.5, 32.0, 15.0)
+        p.setPen(QPen(QColor(255, 255, 255, 195), 1.3))
+        p.setBrush(QColor(0, 0, 0, 255))
+        p.drawRoundedRect(mini_pill, 7.5, 7.5)
         p.setPen(Qt.PenStyle.NoPen)
-        for pi in range(14):
-            seed = pi * 1.6180339
-            px_d = u_card.left() + 26.0 + ((math.sin(seed * 7.3 + self._aurora_phase * (0.28 + (pi % 3) * 0.12)) * 0.5 + 0.5) * (w - 52.0))
-            py_d = u_card.top() + 18.0 + ((math.cos(seed * 5.1 - self._aurora_phase * (0.22 + (pi % 4) * 0.08)) * 0.5 + 0.5) * 185.0)
-            p_alpha = int(32 + 52 * (0.5 + 0.5 * math.sin(self._aurora_phase * 2.6 + seed * 3.0)))
-            p_col = accent_col if (has_upd and pi % 2 == 0) else (QColor(142, 162, 255) if pi % 3 == 0 else QColor(255, 255, 255))
-            p.setBrush(QColor(p_col.red(), p_col.green(), p_col.blue(), p_alpha))
-            pr = 1.2 + (pi % 3) * 0.55
-            p.drawEllipse(QPointF(px_d, py_d), pr, pr)
+        p.setBrush(QColor(255, 255, 255, 240))
+        p.drawEllipse(QPointF(mini_pill.left() + 10.5, mini_pill.center().y()), 2.2, 2.6)
+        p.drawEllipse(QPointF(mini_pill.left() + 17.5, mini_pill.center().y()), 2.2, 2.6)
 
-        # Top-Left Hardware Engine Pill (Rust Core v2.1 Native DLL status + Display Hz) & Top-Right Channel Pill
-        rust_active = RUST_CORE.is_loaded
-        rc_pill = QRectF(u_card.left() + 16.0, u_card.top() + 14.0, 152.0, 22.0)
-        p.setPen(QPen(QColor(251, 146, 60, 120) if rust_active else QColor(148, 163, 184, 70), 1.0))
-        p.setBrush(QColor(42, 24, 14, 195) if rust_active else QColor(24, 25, 34, 190))
-        p.drawRoundedRect(rc_pill, 11.0, 11.0)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(251, 146, 60, 245) if rust_active else QColor(148, 163, 184, 210))
-        p.drawEllipse(QPointF(rc_pill.left() + 11.0, rc_pill.center().y()), 3.0, 3.0)
-        p.setPen(QColor(255, 218, 185, 248) if rust_active else QColor(200, 206, 220, 220))
-        p.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        # Crisp Clean Title & Status Typography
+        p.setPen(QColor(248, 248, 252, 255))
+        p.setFont(QFont("Segoe UI Variable Display", 16, QFont.Weight.Bold))
         p.drawText(
-            rc_pill.adjusted(18, 0, -4, 0),
-            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-            f"Rust Core v2.2 · {self._display_hz}Hz" if rust_active else f"Python Engine · {self._display_hz}Hz",
-        )
-
-        gh_pill = QRectF(u_card.right() - 122.0, u_card.top() + 14.0, 106.0, 22.0)
-        p.setPen(QPen(QColor(142, 162, 255, 75), 1.0))
-        p.setBrush(QColor(22, 24, 36, 190))
-        p.drawRoundedRect(gh_pill, 11.0, 11.0)
-        p.setPen(QColor(186, 198, 255, 235))
-        p.setFont(QFont("Segoe UI", 7, QFont.Weight.DemiBold))
-        p.drawText(gh_pill, Qt.AlignmentFlag.AlignCenter, "GitHub OTA")
-
-        # 3-Ring Counter-Rotating Orbital Gyroscope around central emblem + satellite nodes
-        ring_specs = [
-            (49.0, 48.0, 200, 1.15, 72),
-            (39.0, -64.0, 235, 1.35, 115),
-            (31.0, 92.0, 150, 1.05, 85),
-        ]
-        orb_c_base = accent_col if has_upd else QColor(74, 222, 128)
-        for ri, (r_rad, spd, span_deg, pen_w, alpha_v) in enumerate(ring_specs):
-            ang_deg = (self._aurora_phase * spd + ri * 75.0) % 360.0
-            r_col = QColor(142, 162, 255, alpha_v) if (ri == 2 and has_upd) else QColor(orb_c_base.red(), orb_c_base.green(), orb_c_base.blue(), alpha_v)
-            p.setPen(QPen(r_col, pen_w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawArc(QRectF(orb_pt.x() - r_rad, orb_pt.y() - r_rad, r_rad * 2, r_rad * 2), int(ang_deg * 16), span_deg * 16)
-            # Orbiting luminous satellite dot at arc tip
-            rad_tip = math.radians(-ang_deg)
-            sx_dot = orb_pt.x() + math.cos(rad_tip) * r_rad
-            sy_dot = orb_pt.y() + math.sin(rad_tip) * r_rad
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(255, 255, 255, 210 if ri == 1 else 160))
-            p.drawEllipse(QPointF(sx_dot, sy_dot), 2.1 if ri == 1 else 1.5, 2.1 if ri == 1 else 1.5)
-
-        core_grad = QRadialGradient(orb_pt.x(), orb_pt.y() - 6.0, 28.0)
-        core_grad.setColorAt(0.0, QColor(36, 36, 48, 255))
-        core_grad.setColorAt(1.0, QColor(14, 14, 20, 255))
-        p.setPen(QPen(orb_c_base if has_upd else QColor(74, 222, 128, 205), 1.65))
-        p.setBrush(QBrush(core_grad))
-        p.drawEllipse(orb_pt, 25.0, 25.0)
-        if has_upd:
-            VectorIcons.draw_download_arrow(p, orb_pt, 20.0, accent_col)
-        else:
-            VectorIcons.draw_refresh(p, orb_pt, 20.0, QColor(74, 222, 128, 250))
-
-        # App Title & Version Transition Pill
-        p.setPen(QColor(255, 255, 255, 252))
-        p.setFont(QFont("Segoe UI Variable Display", 14, QFont.Weight.Bold))
-        p.drawText(
-            QRectF(u_card.left(), u_card.top() + 114.0, w, 24.0),
+            QRectF(u_card.left(), u_card.top() + 102.0, w, 28.0),
             Qt.AlignmentFlag.AlignCenter,
-            f"Island  v{self.updater.local_version}",
+            f"Island {self.updater.local_version}",
         )
 
-        status_pill = QRectF(cx_u - 122.0, u_card.top() + 141.0, 244.0, 25.0)
-        p.setPen(QPen(accent_col if has_upd else QColor(74, 222, 128, 125), 1.1))
-        p.setBrush(QColor(44, 18, 34, 218) if has_upd else QColor(16, 40, 28, 200))
-        p.drawRoundedRect(status_pill, 12.5, 12.5)
-        p.setPen(QColor(255, 228, 240) if has_upd else QColor(167, 243, 208))
-        p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        p.setPen(QColor(152, 152, 160, 245))
+        p.setFont(QFont("Segoe UI", 9, QFont.Weight.Medium))
         p.drawText(
-            status_pill,
+            QRectF(u_card.left(), u_card.top() + 132.0, w, 20.0),
             Qt.AlignmentFlag.AlignCenter,
-            f"Доступна сборка  v{self.updater.remote_version}" if has_upd else "Установлена актуальная версия",
+            f"Доступно обновление {self.updater.remote_version}" if has_upd else "Установлена последняя версия",
         )
 
-        # Centerpiece Hero 'Обновить' Button (276 x 52 px)
-        act_btn = QRectF(cx_u - 138.0, u_card.top() + 178.0, 276.0, 52.0)
+        rust_lbl = f"Rust Core 2.3 · {self._display_hz} Гц" if RUST_CORE.is_loaded else f"Python · {self._display_hz} Гц"
+        p.setPen(QColor(92, 92, 102, 230))
+        p.setFont(QFont("Segoe UI", 8))
+        p.drawText(
+            QRectF(u_card.left(), u_card.top() + 153.0, w, 18.0),
+            Qt.AlignmentFlag.AlignCenter,
+            rust_lbl,
+        )
+
+        # Clean Tactile Primary Action Button (Solid pure white Apple CTA when update available — zero neon gradient!)
+        act_btn = QRectF(cx_u - 118.0, u_card.top() + 190.0, 236.0, 44.0)
         if has_upd:
             self._hitboxes["btn_github_update"] = act_btn
             hu, pu = self._get_btn_springs("btn_github_update")
-            sc_b = 1.0 + hu.value * 0.04 - pu.value * 0.06
+            sc_b = 1.0 + hu.value * 0.025 - pu.value * 0.045
             p.save()
             p.translate(act_btn.center())
             p.scale(sc_b, sc_b)
             p.translate(-act_btn.center())
-
-            # Multi-layer breathing plasma halo
-            glow_rect = act_btn.adjusted(-11, -11, 11, 11)
-            for gi in range(4):
-                gr = glow_rect.adjusted(gi * 2.4, gi * 2.4, -gi * 2.4, -gi * 2.4)
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(
-                    QColor(
-                        accent_col.red(),
-                        accent_col.green(),
-                        accent_col.blue(),
-                        int((24 + 24 * breathe + 40 * hu.value) / (gi + 1)),
-                    )
-                )
-                p.drawRoundedRect(gr, 25.0 - gi * 2.0, 25.0 - gi * 2.0)
-
-            btn_path = QPainterPath()
-            btn_path.addRoundedRect(act_btn, 18.0, 18.0)
-            btn_grad = QLinearGradient(act_btn.topLeft(), act_btn.bottomRight())
-            btn_grad.setColorAt(0.0, accent_col)
-            btn_grad.setColorAt(0.48, QColor(244, 114, 182, 255))
-            btn_grad.setColorAt(1.0, QColor(129, 140, 248, 255))
-            p.fillPath(btn_path, QBrush(btn_grad))
-
-            # Top glass reflection + animated diagonal light sheen
-            p.save()
-            p.setClipPath(btn_path, Qt.ClipOperation.IntersectClip)
-            gloss = QLinearGradient(act_btn.topLeft(), act_btn.bottomLeft())
-            gloss.setColorAt(0.0, QColor(255, 255, 255, 92))
-            gloss.setColorAt(0.46, QColor(255, 255, 255, 0))
-            p.fillRect(act_btn, QBrush(gloss))
-
-            sweep_t = (self._aurora_phase * 0.42) % 1.8 - 0.4
-            sx = act_btn.left() + sweep_t * act_btn.width()
-            sweep = QLinearGradient(QPointF(sx - 56, 0), QPointF(sx + 56, 0))
-            sweep.setColorAt(0.0, QColor(255, 255, 255, 0))
-            sweep.setColorAt(0.5, QColor(255, 255, 255, 98))
-            sweep.setColorAt(1.0, QColor(255, 255, 255, 0))
-            p.fillRect(act_btn, QBrush(sweep))
-            p.restore()
-
-            p.setPen(QPen(QColor(255, 255, 255, 105), 1.2))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRoundedRect(act_btn.adjusted(0.5, 0.5, -0.5, -0.5), 18.0, 18.0)
-
-            # Animated download icon + 'Обновить' + version badge chip
-            ic_c = QPointF(act_btn.left() + 34.0, act_btn.center().y() + math.sin(self._aurora_phase * 4.5) * 1.4)
-            VectorIcons.draw_download_arrow(p, ic_c, 18.0, QColor(255, 255, 255, 255))
-
-            p.setPen(QColor(255, 255, 255, 255))
-            p.setFont(QFont("Segoe UI Variable Display", 11, QFont.Weight.Bold))
-            p.drawText(
-                QRectF(act_btn.left() + 54.0, act_btn.top(), 132.0, act_btn.height()),
-                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                "Обновить",
-            )
-
-            v_chip = QRectF(act_btn.right() - 78.0, act_btn.center().y() - 12.0, 62.0, 24.0)
-            p.setPen(QPen(QColor(255, 255, 255, 82), 1.0))
-            p.setBrush(QColor(0, 0, 0, 88))
-            p.drawRoundedRect(v_chip, 12.0, 12.0)
-            p.setPen(QColor(255, 255, 255, 252))
-            p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-            p.drawText(v_chip, Qt.AlignmentFlag.AlignCenter, f"v{self.updater.remote_version}")
+            fill_v = int(lerp(245, 255, hu.value))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(fill_v, fill_v, fill_v, 255))
+            p.drawRoundedRect(act_btn, 14.0, 14.0)
+            p.setPen(QColor(8, 8, 12, 255))
+            p.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            p.drawText(act_btn, Qt.AlignmentFlag.AlignCenter, f"Обновить до {self.updater.remote_version}")
             p.restore()
         else:
             self._hitboxes["btn_github_check"] = act_btn
             hc, _ = self._get_btn_springs("btn_github_check")
             checking = self.updater.status == "checking"
-            p.setPen(QPen(QColor(255, 255, 255, int(lerp(28, 76, hc.value))), 1.1))
-            p.setBrush(QColor(int(lerp(22, 34, hc.value)), int(lerp(23, 35, hc.value)), int(lerp(32, 46, hc.value)), 255))
-            p.drawRoundedRect(act_btn, 18.0, 18.0)
-            chk_font = QFont("Segoe UI", 10, QFont.Weight.Bold)
-            label = "Проверка обновлений..." if checking else "Проверить обновления"
-            tw_lbl = QFontMetrics(chk_font).horizontalAdvance(label)
-            total_w = 18.0 + 10.0 + tw_lbl
-            ic_c = QPointF(act_btn.center().x() - total_w * 0.5 + 9.0, act_btn.center().y())
-            p.save()
-            p.translate(ic_c)
-            p.rotate((self._wave_phase * 60.0) % 360.0 if checking else hc.value * 180.0)
-            p.translate(-ic_c)
-            VectorIcons.draw_refresh(p, ic_c, 15.0, QColor(232, 234, 246, 245))
-            p.restore()
-            p.setPen(QColor(238, 240, 250, 248))
-            p.setFont(chk_font)
-            p.drawText(
-                QRectF(ic_c.x() + 18.0, act_btn.top(), tw_lbl + 6.0, act_btn.height()),
-                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                label,
-            )
+            p.setPen(QPen(QColor(255, 255, 255, int(lerp(22, 60, hc.value))), 1.0))
+            p.setBrush(QColor(int(lerp(26, 36, hc.value)), int(lerp(26, 36, hc.value)), int(lerp(32, 44, hc.value)), 255))
+            p.drawRoundedRect(act_btn, 14.0, 14.0)
+            p.setPen(QColor(238, 238, 245, 248))
+            p.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
+            p.drawText(act_btn, Qt.AlignmentFlag.AlignCenter, "Проверка..." if checking else "Проверить обновления")
 
-        # Pure Sacred Update Studio — NO extra feature buttons here (all moved to Tab 6 Управление!)
-        # Symmetrical Bottom Legal Pills ('Политика конфиденциальности' & 'Пользовательское соглашение')
-        btn_priv = QRectF(cx_u - 216.0, u_card.bottom() - 50.0, 208.0, 32.0)
-        btn_cons = QRectF(cx_u + 8.0, u_card.bottom() - 50.0, 208.0, 32.0)
+        # Symmetrical Quiet Bottom Legal Pills ('Политика конфиденциальности' & 'Пользовательское соглашение')
+        btn_priv = QRectF(cx_u - 216.0, u_card.bottom() - 48.0, 208.0, 32.0)
+        btn_cons = QRectF(cx_u + 8.0, u_card.bottom() - 48.0, 208.0, 32.0)
         self._hitboxes["btn_open_privacy"] = btn_priv
         self._hitboxes["btn_open_consent"] = btn_cons
 
