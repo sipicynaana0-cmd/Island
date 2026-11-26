@@ -155,9 +155,11 @@ def main():
 
     act_quit = QAction("Выход", menu)
     def _on_quit():
+        audio._running = False
         media.stop()
         tray.hide()
         app.quit()
+        os._exit(0)
     act_quit.triggered.connect(_on_quit)
     menu.addAction(act_quit)
 
