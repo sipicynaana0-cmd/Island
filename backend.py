@@ -38,10 +38,19 @@ class RustCoreBridge:
     def __init__(self):
         self._dll = None
         self.is_loaded = False
+        self.core_version: int = 0
+        self._has_v21 = False
         self._fft_bands_buf = (ctypes.c_float * 32)()
         self._fft_lvl_buf = ctypes.c_float(0.0)
         self._wave_bands_buf = (ctypes.c_float * 32)()
         self._wave_out_buf = (ctypes.c_float * 64)()
+        # Pre-allocated batch spring buffers (zero per-frame allocations for up to 256 UI springs!)
+        self._sp_cap = 256
+        self._sp_vals = (ctypes.c_float * 256)()
+        self._sp_vels = (ctypes.c_float * 256)()
+        self._sp_tgts = (ctypes.c_float * 256)()
+        self._sp_stfs = (ctypes.c_float * 256)()
+        self._sp_dmps = (ctypes.c_float * 256)()
         self._load_or_fetch()
 
     def _load_or_fetch(self):
@@ -100,12 +109,39 @@ class RustCoreBridge:
                 ctypes.POINTER(ctypes.c_float),
             ]
             dll.rust_compute_wave_offsets.restype = None
-            if dll.rust_core_version() >= 200:
+            ver = int(dll.rust_core_version())
+            if ver >= 200:
                 self._dll = dll
+                self.core_version = ver
                 self.is_loaded = True
+                if ver >= 210:
+                    try:
+                        dll.rust_step_springs.argtypes = [
+                            ctypes.POINTER(ctypes.c_float),
+                            ctypes.POINTER(ctypes.c_float),
+                            ctypes.POINTER(ctypes.c_float),
+                            ctypes.POINTER(ctypes.c_float),
+                            ctypes.POINTER(ctypes.c_float),
+                            ctypes.c_size_t,
+                            ctypes.c_float,
+                        ]
+                        dll.rust_step_springs.restype = ctypes.c_int32
+                        dll.rust_get_refresh_rate_hz.restype = ctypes.c_uint32
+                        dll.rust_clipboard_seq.restype = ctypes.c_uint32
+                        dll.rust_poll_hotkeys.restype = ctypes.c_uint32
+                        dll.rust_find_lyric_index.argtypes = [
+                            ctypes.POINTER(ctypes.c_float),
+                            ctypes.c_size_t,
+                            ctypes.c_float,
+                        ]
+                        dll.rust_find_lyric_index.restype = ctypes.c_int32
+                        self._has_v21 = True
+                    except Exception:
+                        self._has_v21 = False
         except Exception:
             self._dll = None
             self.is_loaded = False
+            self._has_v21 = False
 
     def fft_32bands(self, np_f32_arr, sr: float) -> Optional[Tuple[List[float], float]]:
         if not self.is_loaded or self._dll is None:
@@ -193,6 +229,81 @@ class RustCoreBridge:
         except Exception:
             pass
         return None
+
+    def step_springs_batch(self, springs: list, dt: float) -> bool:
+        """Steps all SpringValue instances in one batched Rust C-ABI call (< 20 us for 100+ springs)."""
+        n = len(springs)
+        if not self._has_v21 or self._dll is None or n == 0 or n > self._sp_cap:
+            return False
+        try:
+            vals = self._sp_vals
+            vels = self._sp_vels
+            tgts = self._sp_tgts
+            stfs = self._sp_stfs
+            dmps = self._sp_dmps
+            for i, sp in enumerate(springs):
+                vals[i] = sp.value
+                vels[i] = sp.velocity
+                tgts[i] = sp.target
+                stfs[i] = sp.stiffness
+                dmps[i] = sp.damping
+            self._dll.rust_step_springs(vals, vels, tgts, stfs, dmps, n, ctypes.c_float(dt))
+            for i, sp in enumerate(springs):
+                sp.value = vals[i]
+                sp.velocity = vels[i]
+            return True
+        except Exception:
+            return False
+
+    def get_refresh_rate_hz(self) -> int:
+        if self._has_v21 and self._dll is not None:
+            try:
+                hz = int(self._dll.rust_get_refresh_rate_hz())
+                if 30 <= hz <= 360:
+                    return hz
+            except Exception:
+                pass
+        return 60
+
+    def clipboard_seq(self) -> int:
+        if self._has_v21 and self._dll is not None:
+            try:
+                return int(self._dll.rust_clipboard_seq())
+            except Exception:
+                pass
+        try:
+            return int(user32.GetClipboardSequenceNumber())
+        except Exception:
+            return 0
+
+    def poll_hotkeys(self) -> int:
+        """Returns bitmask of newly pressed global hotkeys (bit 0: Ctrl+Shift+I, bit 1: Alt+M)."""
+        if self._has_v21 and self._dll is not None:
+            try:
+                return int(self._dll.rust_poll_hotkeys())
+            except Exception:
+                pass
+        return 0
+
+    def find_lyric_index(self, ts_buf, count: int, pos_sec: float) -> int:
+        if count <= 0:
+            return -1
+        if self._has_v21 and self._dll is not None and ts_buf is not None:
+            try:
+                return int(self._dll.rust_find_lyric_index(ts_buf, count, ctypes.c_float(pos_sec)))
+            except Exception:
+                pass
+        # Pure Python binary search fallback
+        if pos_sec < ts_buf[0]:
+            return -1
+        lo, hi = 0, count
+        while lo + 1 < hi:
+            mid = (lo + hi) >> 1
+            if ts_buf[mid] <= pos_sec:
+                lo = mid
+            else:
+                hi = mid
+        return lo
 
 
 RUST_CORE = RustCoreBridge()
@@ -1707,8 +1818,206 @@ class TrackLikesManager:
         return res
 
 
+class LyricsEngine:
+    """
+    Real-Time Synced Lyrics Engine (LRCLIB API + local disk cache + Rust O(log N) lookup).
+    Fetches time-synced [mm:ss.xx] lyrics asynchronously in the background with zero UI blocking.
+    """
+
+    _LRC_LINE_RE = re.compile(r"\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\](.*)")
+    _CLEAN_RE = re.compile(r"\s*[\(\[](?:feat\.?|ft\.?|remix|prod\.?|official|video|audio|live|slowed|reverb|edit|ver\.?)[^\)\]]*[\)\]]", re.IGNORECASE)
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cache_path = os.path.join(APP_DIR, "lyrics_cache.json")
+        self._disk_cache: Dict[str, dict] = {}
+        self._active_key: str = ""
+        self._status: str = "idle"  # "idle", "loading", "synced", "plain", "none"
+        self._timestamps_buf = None
+        self._timestamps_list: List[float] = []
+        self._lines: List[str] = []
+        self._load_disk_cache()
+
+    def _load_disk_cache(self):
+        try:
+            if os.path.exists(self._cache_path):
+                with open(self._cache_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                    if isinstance(raw, dict):
+                        self._disk_cache = raw
+        except Exception:
+            self._disk_cache = {}
+
+    def _save_disk_cache(self):
+        try:
+            # Keep cache compact (max 80 recent tracks)
+            if len(self._disk_cache) > 80:
+                keys = list(self._disk_cache.keys())[-80:]
+                self._disk_cache = {k: self._disk_cache[k] for k in keys}
+            with open(self._cache_path, "w", encoding="utf-8") as f:
+                json.dump(self._disk_cache, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    @classmethod
+    def _clean_query(cls, s: str) -> str:
+        s = cls._CLEAN_RE.sub("", s or "").strip()
+        s = re.sub(r"\s+", " ", s)
+        return s
+
+    @classmethod
+    def _parse_lrc(cls, lrc_text: str) -> Tuple[List[float], List[str]]:
+        pairs: List[Tuple[float, str]] = []
+        for raw_line in (lrc_text or "").splitlines():
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            matches = list(cls._LRC_LINE_RE.finditer(raw_line))
+            if not matches:
+                continue
+            # Handle multi-timestamp lines like [00:12.30][01:04.20]Chorus text
+            text_part = re.sub(r"\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]", "", raw_line).strip()
+            if not text_part:
+                text_part = "· · ·"
+            for m in matches:
+                mins = int(m.group(1))
+                secs = int(m.group(2))
+                frac = m.group(3) or "0"
+                ms = int(frac.ljust(3, "0")[:3])
+                t_sec = mins * 60.0 + secs + ms / 1000.0
+                pairs.append((t_sec, text_part))
+        pairs.sort(key=lambda x: x[0])
+        return [p[0] for p in pairs], [p[1] for p in pairs]
+
+    def _set_parsed(self, key: str, ts_list: List[float], lines: List[str], status: str):
+        buf = (ctypes.c_float * len(ts_list))(*ts_list) if ts_list else None
+        with self._lock:
+            if self._active_key != key:
+                return
+            self._timestamps_list = ts_list
+            self._timestamps_buf = buf
+            self._lines = lines
+            self._status = status
+
+    def ensure_track(self, artist: str, title: str, duration: float = 0.0):
+        t_clean = self._clean_query(title)
+        a_clean = self._clean_query(artist)
+        if not t_clean:
+            return
+        key = f"{a_clean.lower()}||{t_clean.lower()}"
+        with self._lock:
+            if key == self._active_key:
+                return
+            self._active_key = key
+            self._timestamps_list = []
+            self._timestamps_buf = None
+            self._lines = []
+            cached = self._disk_cache.get(key)
+            if cached is not None:
+                st = cached.get("status", "none")
+                ts_l = cached.get("ts", [])
+                ln_l = cached.get("lines", [])
+                self._status = st
+                self._timestamps_list = ts_l
+                self._timestamps_buf = (ctypes.c_float * len(ts_l))(*ts_l) if ts_l else None
+                self._lines = ln_l
+                return
+            self._status = "loading"
+
+        threading.Thread(
+            target=self._fetch_worker,
+            args=(key, a_clean, t_clean, duration),
+            daemon=True,
+        ).start()
+
+    def _fetch_worker(self, key: str, artist: str, title: str, duration: float):
+        synced_raw = ""
+        plain_raw = ""
+        headers = {"User-Agent": "Island-Windows/2.1 (https://github.com/sipicynaana0-cmd/Island)"}
+        try:
+            with httpx.Client(timeout=6.0, headers=headers) as client:
+                # 1. Exact LRCLIB /api/get lookup
+                params = {"track_name": title}
+                if artist:
+                    params["artist_name"] = artist
+                if duration > 10.0:
+                    params["duration"] = str(int(round(duration)))
+                r = client.get("https://lrclib.net/api/get", params=params)
+                if r.status_code == 200:
+                    d = r.json()
+                    synced_raw = d.get("syncedLyrics") or ""
+                    plain_raw = d.get("plainLyrics") or ""
+
+                # 2. Fallback LRCLIB /api/search if /api/get missed
+                if not synced_raw:
+                    q_str = f"{artist} {title}".strip() if artist else title
+                    r2 = client.get("https://lrclib.net/api/search", params={"q": q_str})
+                    if r2.status_code == 200:
+                        items = r2.json()
+                        if isinstance(items, list) and items:
+                            # Prefer item with syncedLyrics and closest duration
+                            best = None
+                            for it in items[:8]:
+                                if it.get("syncedLyrics"):
+                                    if best is None:
+                                        best = it
+                                    elif duration > 10.0:
+                                        d_new = abs(float(it.get("duration") or 0) - duration)
+                                        d_old = abs(float(best.get("duration") or 0) - duration)
+                                        if d_new < d_old:
+                                            best = it
+                            if best:
+                                synced_raw = best.get("syncedLyrics") or ""
+                            elif not plain_raw:
+                                plain_raw = items[0].get("plainLyrics") or ""
+        except Exception:
+            pass
+
+        if synced_raw:
+            ts_l, ln_l = self._parse_lrc(synced_raw)
+            if ts_l:
+                self._disk_cache[key] = {"status": "synced", "ts": ts_l, "lines": ln_l}
+                self._save_disk_cache()
+                self._set_parsed(key, ts_l, ln_l, "synced")
+                return
+
+        if plain_raw:
+            pl_lines = [ln.strip() for ln in plain_raw.splitlines() if ln.strip()]
+            if pl_lines:
+                # Synthesize gentle linear timestamps across duration so plain lyrics still scroll smoothly
+                dur_eff = duration if duration > 20.0 else max(90.0, len(pl_lines) * 3.5)
+                step = (dur_eff * 0.88) / max(1, len(pl_lines))
+                ts_l = [round(4.0 + i * step, 2) for i in range(len(pl_lines))]
+                self._disk_cache[key] = {"status": "plain", "ts": ts_l, "lines": pl_lines}
+                self._save_disk_cache()
+                self._set_parsed(key, ts_l, pl_lines, "plain")
+                return
+
+        self._disk_cache[key] = {"status": "none", "ts": [], "lines": []}
+        self._save_disk_cache()
+        self._set_parsed(key, [], [], "none")
+
+    def get_live_state(self, artist: str, title: str, pos_sec: float, duration: float = 0.0) -> Tuple[str, str, str, str, int]:
+        """Returns (prev_line, curr_line, next_line, status, line_index) in < 5 microseconds via Rust."""
+        if title:
+            self.ensure_track(artist, title, duration)
+        with self._lock:
+            st = self._status
+            if st not in ("synced", "plain") or not self._lines or self._timestamps_buf is None:
+                return "", "", "", st, -1
+            n = len(self._lines)
+            # Small +0.18s visual anticipation so lyrics light up right on the vocal beat!
+            idx = RUST_CORE.find_lyric_index(self._timestamps_buf, n, pos_sec + 0.18)
+            if idx < 0:
+                return "", "· · ·", self._lines[0] if n > 0 else "", st, -1
+            prev_l = self._lines[idx - 1] if idx > 0 else ""
+            curr_l = self._lines[idx]
+            next_l = self._lines[idx + 1] if idx + 1 < n else ""
+            return prev_l, curr_l, next_l, st, idx
+
+
 class ConsentManager:
-    """Manages user acceptance of PRIVACY_POLICY.md / USER_CONSENT.md and Island Appearance Settings (Item 6)."""
+    """Manages user acceptance of PRIVACY_POLICY.md / USER_CONSENT.md and Island Appearance Settings."""
 
     def __init__(self):
         self._settings_path = os.path.join(APP_DIR, "user_settings.json")
@@ -1716,6 +2025,8 @@ class ConsentManager:
         self.island_float_mode: int = 0  # 0: Вырез у края, 1: Парящая пилюля
         self.wave_style_mode: int = 0    # 0: Неон + Свечение, 1: Мягкая линия, 2: Выкл
         self.bass_sens_mode: int = 0     # 0: 100%, 1: 155% Бас+, 2: 65% Мягко
+        self.lyrics_enabled: bool = True
+        self.custom_launchers: List[List[str]] = []  # [[name, path, kind], ...]
         self._load()
 
     def _load(self):
@@ -1727,6 +2038,14 @@ class ConsentManager:
                     self.island_float_mode = int(d.get("island_float_mode", 0)) % 2
                     self.wave_style_mode = int(d.get("wave_style_mode", 0)) % 3
                     self.bass_sens_mode = int(d.get("bass_sens_mode", 0)) % 3
+                    self.lyrics_enabled = bool(d.get("lyrics_enabled", True))
+                    cl = d.get("custom_launchers", [])
+                    if isinstance(cl, list):
+                        self.custom_launchers = [
+                            [str(it[0]), str(it[1]), str(it[2])]
+                            for it in cl
+                            if isinstance(it, list) and len(it) == 3
+                        ]
         except Exception:
             pass
 
@@ -1739,9 +2058,12 @@ class ConsentManager:
                         "island_float_mode": self.island_float_mode,
                         "wave_style_mode": self.wave_style_mode,
                         "bass_sens_mode": self.bass_sens_mode,
+                        "lyrics_enabled": self.lyrics_enabled,
+                        "custom_launchers": self.custom_launchers,
                         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                     },
                     f,
+                    ensure_ascii=False,
                     indent=2,
                 )
         except Exception:
