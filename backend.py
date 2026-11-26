@@ -723,8 +723,9 @@ class AudioEngine:
         self._smooth_peak += (tgt_peak - self._smooth_peak) * (attack if tgt_peak > self._smooth_peak else release)
         return self._smooth_peak, list(sb)
 
-    def get_app_sessions(self) -> List[AppAudioSession]:
-        self._want_sessions_poll = True
+    def get_app_sessions(self, trigger_poll: bool = False) -> List[AppAudioSession]:
+        if trigger_poll:
+            self._want_sessions_poll = True
         return list(self._cached_sessions)
 
     def set_app_volume(self, app_name: str, volume: float):
@@ -1100,7 +1101,12 @@ class MediaSessionWorker:
 
 
 class SystemTelemetry:
-    """Background-polled system metrics (CPU, RAM, GPU/Disk, Network speed, Battery) — zero UI thread cost."""
+    """
+    Background-polled system metrics (CPU, RAM, GPU, Network speed, Battery)
+    + iOS-style Privacy Sensors (Active Microphone & Webcam app detection via Windows ConsentStore)
+    + Live Messenger & System Notification Watcher (Telegram, Discord, Steam, Audio Device switch)
+    — 0.0ms UI thread cost.
+    """
 
     def __init__(self):
         self.cpu_percent: int = 18
@@ -1111,17 +1117,154 @@ class SystemTelemetry:
         self.battery_percent: Optional[int] = None
         self.battery_charging: bool = False
         self.is_dark_theme: bool = True
+
+        # iOS Privacy Dots (Item 2): Active Microphone (Orange) & Camera (Green)
+        self.mic_active: bool = False
+        self.mic_app: str = ""
+        self.cam_active: bool = False
+        self.cam_app: str = ""
+
+        # Live Notifications Queue (Item 1: Telegram / Discord / Audio Device connection)
+        self._notif_queue: List[Dict[str, str]] = []
+        self._seen_win_titles: Dict[int, str] = {}
+        self._last_audio_dev: str = ""
+        self._last_mic_state: bool = False
+        self._last_cam_state: bool = False
+
         self._last_net_recv = 0
         self._last_net_sent = 0
         self._last_net_time = 0.0
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
 
+    def pop_notification(self) -> Optional[Dict[str, str]]:
+        if self._notif_queue:
+            return self._notif_queue.pop(0)
+        return None
+
+    def push_notification(self, app_name: str, title: str, subtitle: str, target_kw: str = ""):
+        self._notif_queue.append(
+            {
+                "app": app_name,
+                "title": title,
+                "subtitle": subtitle,
+                "target": target_kw or app_name.lower(),
+            }
+        )
+        if len(self._notif_queue) > 5:
+            self._notif_queue = self._notif_queue[-5:]
+
     def update_if_due(self, interval: float = 1.0):
-        # No-op on UI thread: background thread keeps all fields fresh automatically
         pass
 
+    def _check_privacy_sensors(self):
+        import winreg
+
+        for kind, reg_name in (("mic", "microphone"), ("cam", "webcam")):
+            found_apps: List[str] = []
+            base = rf"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\{reg_name}"
+            for sub_root in (base, base + r"\NonPackaged"):
+                try:
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub_root) as k:
+                        i = 0
+                        while True:
+                            try:
+                                sub_name = winreg.EnumKey(k, i)
+                                i += 1
+                                if sub_name == "NonPackaged":
+                                    continue
+                                with winreg.OpenKey(k, sub_name) as sk:
+                                    stop_t, _ = winreg.QueryValueEx(sk, "LastUsedTimeStop")
+                                    start_t, _ = winreg.QueryValueEx(sk, "LastUsedTimeStart")
+                                    if start_t > 0 and stop_t == 0:
+                                        exe = sub_name.split("#")[-1].replace(".exe", "")
+                                        clean = exe[:1].upper() + exe[1:]
+                                        if clean not in found_apps:
+                                            found_apps.append(clean)
+                            except OSError:
+                                break
+                except OSError:
+                    pass
+            if kind == "mic":
+                self.mic_active = len(found_apps) > 0
+                self.mic_app = found_apps[0] if found_apps else ""
+                if self.mic_active and not self._last_mic_state:
+                    self.push_notification("Микрофон", f"Микрофон: {self.mic_app}", "Активен захват голоса", self.mic_app)
+                self._last_mic_state = self.mic_active
+            else:
+                self.cam_active = len(found_apps) > 0
+                self.cam_app = found_apps[0] if found_apps else ""
+                if self.cam_active and not self._last_cam_state:
+                    self.push_notification("Камера", f"Камера: {self.cam_app}", "Включена веб-камера", self.cam_app)
+                self._last_cam_state = self.cam_active
+
+    def _check_messenger_and_audio_events(self):
+        # 1. Detect default audio device hotplug / switch (Headphones / Speakers)
+        try:
+            import pyaudiowpatch as pyaudio
+
+            pa = pyaudio.PyAudio()
+            try:
+                wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+                spk = pa.get_device_info_by_index(wasapi["defaultOutputDevice"])
+                dev_name = (spk.get("name") or "").strip()
+                if dev_name:
+                    if self._last_audio_dev and dev_name != self._last_audio_dev:
+                        short_dev = dev_name.split("(")[0].strip() or dev_name[:22]
+                        self.push_notification("Аудио", f"Подключено: {short_dev}", "Аудиовыход переключён", "")
+                    self._last_audio_dev = dev_name
+            finally:
+                pa.terminate()
+        except Exception:
+            pass
+
+        # 2. Watch Telegram / Discord / WhatsApp / Steam windows for incoming unread badges or toast popups
+        try:
+            fg_hwnd = user32.GetForegroundWindow()
+
+            @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+            def enum_cb(hwnd, lparam):
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length <= 0:
+                    return True
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = buf.value.strip()
+                if not title:
+                    return True
+
+                prev_title = self._seen_win_titles.get(hwnd)
+                self._seen_win_titles[hwnd] = title
+                if prev_title is None or prev_title == title or hwnd == fg_hwnd:
+                    return True
+
+                low = title.lower()
+                # Check unread count pattern like '(1) Telegram', 'Telegram (2)', '• Discord', '(1) Discord'
+                m_new = re.search(r"\((\d+)\)", title)
+                m_old = re.search(r"\((\d+)\)", prev_title) if prev_title else None
+                cnt_new = int(m_new.group(1)) if m_new else (1 if title.startswith("•") and not prev_title.startswith("•") else 0)
+                cnt_old = int(m_old.group(1)) if m_old else 0
+
+                if cnt_new > cnt_old:
+                    if "telegram" in low:
+                        self.push_notification("Telegram", "Telegram · Сообщение", f"Непрочитанных: {cnt_new} (клик — открыть)", "telegram")
+                    elif "discord" in low:
+                        clean_ch = re.sub(r"^\(\d+\)\s*|•\s*", "", title).split("-")[0].strip()[:26]
+                        self.push_notification("Discord", f"Discord · {clean_ch}", "Новое сообщение в канале", "discord")
+                    elif "whatsapp" in low:
+                        self.push_notification("WhatsApp", "WhatsApp · Сообщение", f"Новых сообщений: {cnt_new}", "whatsapp")
+                    elif "vk" in low or "вконтакте" in low:
+                        self.push_notification("VK", "ВКонтакте · Уведомление", title[:32], "chrome")
+                return True
+
+            user32.EnumWindows(enum_cb, 0)
+        except Exception:
+            pass
+
     def _poll_loop(self):
+        tick = 0
         while True:
             try:
                 now = time.monotonic()
@@ -1144,9 +1287,14 @@ class SystemTelemetry:
                 if bat is not None:
                     self.battery_percent = int(round(bat.percent))
                     self.battery_charging = bool(bat.power_plugged)
+
+                self._check_privacy_sensors()
+                if tick % 2 == 0:
+                    self._check_messenger_and_audio_events()
+                tick += 1
             except Exception:
                 pass
-            time.sleep(1.1)
+            time.sleep(1.0)
 
     @staticmethod
     def _fmt_speed(bps: float) -> str:
@@ -1359,11 +1507,14 @@ class TrackLikesManager:
 
 
 class ConsentManager:
-    """Manages user acceptance of PRIVACY_POLICY.md and USER_CONSENT.md."""
+    """Manages user acceptance of PRIVACY_POLICY.md / USER_CONSENT.md and Island Appearance Settings (Item 6)."""
 
     def __init__(self):
         self._settings_path = os.path.join(APP_DIR, "user_settings.json")
         self.accepted: bool = True
+        self.island_float_mode: int = 0  # 0: Вырез у края, 1: Парящая пилюля
+        self.wave_style_mode: int = 0    # 0: Неон + Свечение, 1: Мягкая линия, 2: Выкл
+        self.bass_sens_mode: int = 0     # 0: 100%, 1: 155% Бас+, 2: 65% Мягко
         self._load()
 
     def _load(self):
@@ -1372,16 +1523,32 @@ class ConsentManager:
                 with open(self._settings_path, "r", encoding="utf-8") as f:
                     d = json.load(f)
                     self.accepted = bool(d.get("consent_accepted", True))
+                    self.island_float_mode = int(d.get("island_float_mode", 0)) % 2
+                    self.wave_style_mode = int(d.get("wave_style_mode", 0)) % 3
+                    self.bass_sens_mode = int(d.get("bass_sens_mode", 0)) % 3
+        except Exception:
+            pass
+
+    def save_all(self):
+        try:
+            with open(self._settings_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "consent_accepted": self.accepted,
+                        "island_float_mode": self.island_float_mode,
+                        "wave_style_mode": self.wave_style_mode,
+                        "bass_sens_mode": self.bass_sens_mode,
+                        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    },
+                    f,
+                    indent=2,
+                )
         except Exception:
             pass
 
     def set_accepted(self, val: bool):
         self.accepted = bool(val)
-        try:
-            with open(self._settings_path, "w", encoding="utf-8") as f:
-                json.dump({"consent_accepted": self.accepted, "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}, f, indent=2)
-        except Exception:
-            pass
+        self.save_all()
 
     def read_document(self, filename: str) -> str:
         p = os.path.join(APP_DIR, filename)
