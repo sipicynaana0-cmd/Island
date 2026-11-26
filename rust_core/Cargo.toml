@@ -1,0 +1,15 @@
+[package]
+name = "island_core"
+version = "2.0.0"
+edition = "2021"
+
+[lib]
+name = "island_core"
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
