@@ -177,39 +177,46 @@ class ClipboardEntry:
 
 @dataclass
 class WeatherData:
-    city: str = "Москва"
-    temp: int = 0
-    feels_like: int = -3
-    condition: str = "Переменная облачность"
-    wind_speed: float = 4.5
-    wind_dir_deg: int = 180
-    wind_dir_label: str = "Южный"
-    humidity: int = 78
-    pressure_mm: int = 752
+    city: str = "Автоопределение..."
+    temp: int = -3
+    temp_min: int = -5
+    temp_max: int = 1
+    feels_like: int = -7
+    dew_point: int = -5
+    condition: str = "Пасмурно"
+    wind_speed: float = 3.0
+    wind_dir_deg: int = 115
+    wind_dir_label: str = "Ю-В"
+    humidity: int = 88
+    pressure_mm: int = 746
     uv_index: int = 1
-    precipitation_mm: float = 0.4
-    sunrise: str = "08:15"
-    sunset: str = "16:25"
-    is_snow: bool = False
+    precipitation_mm: float = 0.0
+    sunrise: str = "08:34"
+    sunset: str = "16:58"
+    is_snow: bool = True
     is_rain: bool = False
     hourly: List[Tuple[str, int, float]] = field(default_factory=list)
 
 
 class WeatherWorker:
-    """Fetches real weather data from Open-Meteo using 100% automatic IP geolocation in Russian."""
+    """
+    High-precision automatic Weather Engine for Russia & CIS.
+    Bypasses active VPN tunnels via split-tunneled Yandex Geobase + Open-Meteo Geocoding
+    so the user always sees their true local city and exact meteorological metrics.
+    """
 
     def __init__(self):
         self.data = WeatherData(
             city="Автоопределение...",
             hourly=[
-                ("Сейчас", 0, 0.2),
-                ("16:00", 0, 0.4),
-                ("17:00", -1, 0.3),
-                ("18:00", -1, 0.1),
-                ("19:00", -2, 0.0),
-                ("20:00", -2, 0.0),
-                ("21:00", -3, 0.0),
-                ("22:00", -3, 0.0),
+                ("Сейчас", -3, 0.0),
+                ("20:00", -3, 0.0),
+                ("21:00", -4, 0.0),
+                ("22:00", -4, 0.0),
+                ("23:00", -4, 0.0),
+                ("00:00", -5, 0.0),
+                ("01:00", -5, 0.0),
+                ("02:00", -5, 0.0),
             ],
         )
         self._thread = threading.Thread(target=self._fetch_loop, daemon=True)
@@ -221,79 +228,170 @@ class WeatherWorker:
     def _fetch_loop(self):
         while True:
             self._fetch_once()
-            time.sleep(1800)
+            time.sleep(900)
+
+    RUSSIAN_CITIES_FAST = {
+        "новокузнецк": (53.7575, 87.1360, "Новокузнецк"),
+        "кемерово": (55.3547, 86.0873, "Кемерово"),
+        "красноярск": (56.0153, 92.8932, "Красноярск"),
+        "новосибирск": (55.0084, 82.9357, "Новосибирск"),
+        "барнаул": (53.3474, 83.7784, "Барнаул"),
+        "томск": (56.4846, 84.9476, "Томск"),
+        "омск": (54.9893, 73.3682, "Омск"),
+        "иркутск": (52.2870, 104.2810, "Иркутск"),
+        "екатеринбург": (56.8389, 60.6057, "Екатеринбург"),
+        "москва": (55.7558, 37.6173, "Москва"),
+        "санкт-петербург": (59.9343, 30.3351, "Санкт-Петербург"),
+        "казань": (55.7961, 49.1064, "Казань"),
+    }
+
+    def _resolve_exact_location(self, client: httpx.Client) -> Tuple[float, float, str]:
+        lat, lon, city_name = 53.7575, 87.1360, "Авто"
+        real_ip = None
+
+        # 1. Bypass active VPN tunnel via split-tunneled ya.ru/internet Geobase
+        try:
+            import urllib.request
+            req = urllib.request.Request("https://ya.ru/internet/", headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=4.0) as r_ya:
+                html = r_ya.read().decode("utf-8", errors="replace")
+                m_city = re.search(r'"name"\s*:\s*"([^"]+)"\s*,\s*"ip"\s*:\s*"([^"]+)"', html)
+                if m_city:
+                    ya_city = m_city.group(1).strip()
+                    if ya_city:
+                        fast_hit = self.RUSSIAN_CITIES_FAST.get(ya_city.lower())
+                        if fast_hit:
+                            return fast_hit
+                        r_geo = client.get(
+                            "https://geocoding-api.open-meteo.com/v1/search",
+                            params={"name": ya_city, "count": 1, "language": "ru", "format": "json"},
+                        )
+                        if r_geo.status_code == 200:
+                            results = r_geo.json().get("results") or []
+                            if results:
+                                lat = float(results[0]["latitude"])
+                                lon = float(results[0]["longitude"])
+                                city_name = results[0].get("name") or ya_city
+                                return lat, lon, city_name
+                for m_ip in re.findall(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b", html):
+                    parts = [int(p) for p in m_ip.split(".")]
+                    if all(0 <= p <= 255 for p in parts) and parts[0] not in (0, 10, 127, 172, 192):
+                        real_ip = m_ip
+                        break
+        except Exception:
+            pass
+
+        # 2. Query ip-api with real non-VPN IP if found, otherwise default IP
+        try:
+            ip_url = f"http://ip-api.com/json/{real_ip}?lang=ru" if real_ip else "http://ip-api.com/json/?lang=ru"
+            r_geo = client.get(ip_url)
+            if r_geo.status_code == 200:
+                js = r_geo.json()
+                if js.get("status") == "success" and js.get("lat") is not None:
+                    lat = float(js["lat"])
+                    lon = float(js["lon"])
+                    city_name = js.get("city") or city_name
+                    return lat, lon, city_name
+        except Exception:
+            pass
+
+        # 3. Secondary fallback
+        try:
+            ip_r = client.get("https://ipwho.is/?lang=ru")
+            if ip_r.status_code == 200:
+                js = ip_r.json()
+                if js.get("success") and js.get("latitude") is not None:
+                    lat = float(js["latitude"])
+                    lon = float(js["longitude"])
+                    city_name = js.get("city") or city_name
+        except Exception:
+            pass
+
+        return lat, lon, city_name
 
     def _fetch_once(self):
         try:
-            with httpx.Client(timeout=5.0) as client:
-                lat, lon, city_name = 55.7558, 37.6173, "Авто"
-                # 1. Primary Russian-localized automatic geolocation
-                try:
-                    r_geo = client.get("http://ip-api.com/json/?lang=ru")
-                    if r_geo.status_code == 200:
-                        js = r_geo.json()
-                        if js.get("status") == "success" and js.get("lat") is not None:
-                            lat = float(js["lat"])
-                            lon = float(js["lon"])
-                            city_name = js.get("city") or city_name
-                except Exception:
-                    pass
-
-                # 2. Fallback automatic geolocation
-                if city_name == "Авто":
-                    try:
-                        ip_r = client.get("https://ipwho.is/?lang=ru")
-                        if ip_r.status_code == 200:
-                            js = ip_r.json()
-                            if js.get("success") and js.get("latitude") is not None:
-                                lat = float(js["latitude"])
-                                lon = float(js["longitude"])
-                                city_name = js.get("city") or city_name
-                    except Exception:
-                        pass
+            with httpx.Client(timeout=5.5, follow_redirects=True) as client:
+                lat, lon, city_name = self._resolve_exact_location(client)
 
                 url = (
                     f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
-                    "&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,surface_pressure,wind_speed_10m,wind_direction_10m"
-                    "&hourly=temperature_2m,precipitation,uv_index&timezone=auto&forecast_days=2"
+                    "&current=temperature_2m,relative_humidity_2m,apparent_temperature,dew_point_2m,precipitation,weather_code,surface_pressure,wind_speed_10m,wind_direction_10m"
+                    "&hourly=temperature_2m,precipitation,weather_code"
+                    "&daily=temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_sum"
+                    "&wind_speed_unit=ms&timezone=auto&forecast_days=2"
                 )
                 r = client.get(url)
                 if r.status_code == 200:
                     d = r.json()
                     curr = d.get("current", {})
-                    temp = int(round(curr.get("temperature_2m", 0)))
-                    feels = int(round(curr.get("apparent_temperature", temp - 2)))
-                    hum = int(round(curr.get("relative_humidity_2m", 75)))
+                    daily = d.get("daily", {})
+
+                    temp_f = float(curr.get("temperature_2m", 0.0))
+                    temp = int(round(temp_f))
+                    feels = int(round(float(curr.get("apparent_temperature", temp_f - 2.0))))
+                    dew = int(round(float(curr.get("dew_point_2m", temp_f - 3.0))))
+                    hum = int(round(float(curr.get("relative_humidity_2m", 75))))
                     press_hpa = float(curr.get("surface_pressure", 1002.0))
                     press_mm = int(round(press_hpa * 0.750062))
-                    wind_s = round(float(curr.get("wind_speed_10m", 12.0)) / 3.6, 1)
+                    wind_s = round(float(curr.get("wind_speed_10m", 3.0)), 1)
                     wind_deg = int(curr.get("wind_direction_10m", 180))
                     wcode = int(curr.get("weather_code", 2))
+
+                    t_max_list = daily.get("temperature_2m_max") or [temp + 2]
+                    t_min_list = daily.get("temperature_2m_min") or [temp - 2]
+                    temp_max = int(round(float(t_max_list[0])))
+                    temp_min = int(round(float(t_min_list[0])))
+
+                    sr_list = daily.get("sunrise") or ["08:15"]
+                    ss_list = daily.get("sunset") or ["16:45"]
+                    sunrise_str = sr_list[0].split("T")[-1][:5] if sr_list else "08:15"
+                    sunset_str = ss_list[0].split("T")[-1][:5] if ss_list else "16:45"
+
+                    uv_list = daily.get("uv_index_max") or [1]
+                    uv_idx = max(0, int(round(float(uv_list[0]))))
+
+                    prec_sum_list = daily.get("precipitation_sum") or [0.0]
+                    prec_day = round(float(prec_sum_list[0]), 1)
 
                     dirs = ["Северный", "С-В", "Восточный", "Ю-В", "Южный", "Ю-З", "Западный", "С-З"]
                     w_label = dirs[int(((wind_deg + 22.5) % 360) // 45)]
 
-                    is_snow = wcode in (71, 73, 75, 77, 85, 86) or temp < 0
-                    is_rain = wcode in (51, 53, 55, 61, 63, 65, 80, 81, 82)
-                    if is_snow:
-                        cond = "Снег" if wcode >= 70 else "Морозно"
-                    elif is_rain:
-                        cond = "Дождь"
-                    elif wcode == 0:
-                        cond = "Ясно"
-                    elif wcode in (1, 2, 3):
-                        cond = "Облачно"
-                    else:
-                        cond = "Пасмурно"
+                    is_snow = wcode in (71, 73, 75, 77, 85, 86) or (temp <= 0 and wcode >= 51)
+                    is_rain = wcode in (51, 53, 55, 61, 63, 65, 80, 81, 82) and temp > 0
+                    wcode_map = {
+                        0: "Ясно",
+                        1: "Преим. ясно",
+                        2: "Перем. облачность",
+                        3: "Пасмурно",
+                        45: "Туман",
+                        48: "Изморозь",
+                        51: "Слабая морось",
+                        53: "Морось",
+                        55: "Сильная морось",
+                        61: "Небольшой дождь",
+                        63: "Дождь",
+                        65: "Сильный дождь",
+                        71: "Небольшой снег",
+                        73: "Снег",
+                        75: "Снегопад",
+                        77: "Снежная крупа",
+                        80: "Ливень",
+                        85: "Снежный заряд",
+                        86: "Сильный снегопад",
+                    }
+                    cond = wcode_map.get(wcode, "Снег" if is_snow else ("Дождь" if is_rain else "Облачно"))
 
                     hourly_data = d.get("hourly", {})
                     h_times = hourly_data.get("time", [])
                     h_temps = hourly_data.get("temperature_2m", [])
                     h_Precs = hourly_data.get("precipitation", [])
-                    now_hour_str = time.strftime("%Y-%m-%dT%H:00")
+
+                    curr_time_str = curr.get("time", "")
+                    now_hour_prefix = curr_time_str[:13] if len(curr_time_str) >= 13 else time.strftime("%Y-%m-%dT%H")
                     start_i = 0
                     for idx, t_str in enumerate(h_times):
-                        if t_str >= now_hour_str:
+                        if t_str[:13] >= now_hour_prefix:
                             start_i = idx
                             break
 
@@ -302,22 +400,27 @@ class WeatherWorker:
                         ii = start_i + offset
                         if ii < len(h_times):
                             lbl = "Сейчас" if offset == 0 else h_times[ii].split("T")[-1][:5]
-                            ht = int(round(h_temps[ii])) if ii < len(h_temps) else temp
+                            ht = temp if offset == 0 else (int(round(h_temps[ii])) if ii < len(h_temps) else temp)
                             hp = round(float(h_Precs[ii]), 1) if ii < len(h_Precs) else 0.0
                             hourly_list.append((lbl, ht, hp))
 
                     self.data = WeatherData(
                         city=city_name,
                         temp=temp,
+                        temp_min=temp_min,
+                        temp_max=temp_max,
                         feels_like=feels,
+                        dew_point=dew,
                         condition=cond,
                         wind_speed=wind_s,
                         wind_dir_deg=wind_deg,
                         wind_dir_label=w_label,
                         humidity=hum,
                         pressure_mm=press_mm,
-                        uv_index=1,
-                        precipitation_mm=round(sum(x[2] for x in hourly_list), 1),
+                        uv_index=uv_idx,
+                        precipitation_mm=prec_day,
+                        sunrise=sunrise_str,
+                        sunset=sunset_str,
                         is_snow=is_snow,
                         is_rain=is_rain,
                         hourly=hourly_list or self.data.hourly,
@@ -1149,20 +1252,46 @@ class ConsentManager:
 
 class GitHubUpdater:
     """
-    Over-The-Air (OTA) GitHub Updater connected to https://github.com/sipicynaana0-cmd/Island.
-    Checks version.json and downloads updated files directly from GitHub so any user can update
-    straight from inside the Island app in 1 click!
+    Over-The-Air (OTA) Updater connected to version.json.
+    Shows the Update button ONLY when a newer version is available.
+    When triggered, collapses the Island into a compact loading progress bar and restarts automatically.
     """
 
     REPO_SLUG = "sipicynaana0-cmd/Island"
     RAW_BASE = f"https://raw.githubusercontent.com/{REPO_SLUG}/main"
 
+    DEFAULT_CHANGELOG = [
+        {
+            "title": "Точная геолокация погоды (обход VPN)",
+            "desc": "Определение реального города через гео-базу провайдера, точка росы, мин/макс температуры и почасовой радар.",
+            "tag": "Погода",
+        },
+        {
+            "title": "Сворачивание Острова в шкалу загрузки",
+            "desc": "При нажатии «Обновить» Остров плавно закрывается в компактную капсулу с живой шкалой прогресса и процентами.",
+            "tag": "Анимация",
+        },
+        {
+            "title": "Вкладка обновлений рядом с «Закрепить»",
+            "desc": "Отдельное меню в правом верхнем углу с подробным списком изменений, которые применятся после перезапуска.",
+            "tag": "Интерфейс",
+        },
+        {
+            "title": "Мгновенная перемотка и оценки треков",
+            "desc": "Перемотка треков без откатов назад, скраббинг мышью и векторные кнопки «Нравится / Не нравится».",
+            "tag": "Плеер",
+        },
+    ]
+
     def __init__(self):
         self.local_version: str = self._read_local_version()
         self.remote_version: str = self.local_version
-        self.release_notes: str = "Синхронизация с GitHub..."
+        self.release_notes: str = "Все актуальные улучшения интерфейса и точности погоды"
+        self.changelog: List[Dict[str, str]] = list(self.DEFAULT_CHANGELOG)
+        self.update_available: bool = False
+        self.progress: float = 0.0
         self.status: str = "ready"  # "ready", "checking", "update_available", "downloading", "updated", "error"
-        self.status_text: str = f"Версия v{self.local_version} · GitHub подключён"
+        self.status_text: str = f"Установлена версия v{self.local_version}"
         self.check_async()
 
     def _read_local_version(self) -> str:
@@ -1170,16 +1299,21 @@ class GitHubUpdater:
         try:
             if os.path.exists(vp):
                 with open(vp, "r", encoding="utf-8") as f:
-                    return json.load(f).get("version", "1.3.0")
+                    return json.load(f).get("version", "1.4.0")
         except Exception:
             pass
-        return "1.3.0"
+        return "1.4.0"
+
+    @staticmethod
+    def _parse_ver(v: str) -> Tuple[int, ...]:
+        parts = re.findall(r"\d+", v or "0")
+        return tuple(int(x) for x in parts) if parts else (0,)
 
     def check_async(self):
         if self.status == "downloading":
             return
         self.status = "checking"
-        self.status_text = "Проверка обновлений на GitHub..."
+        self.status_text = "Проверка доступных обновлений..."
         threading.Thread(target=self._check_worker, daemon=True).start()
 
     def _check_worker(self):
@@ -1190,33 +1324,51 @@ class GitHubUpdater:
                 if r.status_code == 200:
                     data = r.json()
                     self.remote_version = data.get("version", self.local_version)
-                    self.release_notes = data.get("notes", "")
-                    if self.remote_version != self.local_version:
+                    self.release_notes = data.get("notes", self.release_notes)
+                    remote_cl = data.get("changelog")
+                    if isinstance(remote_cl, list) and len(remote_cl) > 0:
+                        self.changelog = remote_cl
+                    if self._parse_ver(self.remote_version) > self._parse_ver(self.local_version):
+                        self.update_available = True
                         self.status = "update_available"
-                        self.status_text = f"Доступно обновление v{self.remote_version}!"
+                        self.status_text = f"Доступно обновление v{self.remote_version}"
                     else:
+                        self.update_available = False
                         self.status = "ready"
-                        self.status_text = f"Установлена последняя v{self.local_version}"
+                        self.status_text = f"Установлена актуальная v{self.local_version}"
                 else:
+                    self.update_available = False
                     self.status = "ready"
-                    self.status_text = f"v{self.local_version} · Репозиторий готов"
+                    self.status_text = f"Установлена версия v{self.local_version}"
         except Exception:
+            self.update_available = False
             self.status = "ready"
-            self.status_text = f"v{self.local_version} · Локальный режим"
+            self.status_text = f"Установлена версия v{self.local_version}"
 
     def install_update_async(self):
         if self.status == "downloading":
             return
         self.status = "downloading"
-        self.status_text = "Загрузка файлов с GitHub..."
+        self.progress = 0.04
+        self.status_text = "Подготовка обновления..."
         threading.Thread(target=self._download_and_restart_worker, daemon=True).start()
 
     def _download_and_restart_worker(self):
-        files_to_sync = ["version.json", "backend.py", "island_ui.py", "main.py", "PRIVACY_POLICY.md", "USER_CONSENT.md"]
+        files_to_sync = [
+            ("backend.py", "Ядро и геолокация"),
+            ("island_ui.py", "Интерфейс и анимации 120 Гц"),
+            ("main.py", "Системный модуль"),
+            ("PRIVACY_POLICY.md", "Политика конфиденциальности"),
+            ("USER_CONSENT.md", "Пользовательское соглашение"),
+            ("version.json", "Манифест версии"),
+        ]
         updated_count = 0
+        total = len(files_to_sync)
         try:
             with httpx.Client(timeout=10.0) as client:
-                for fname in files_to_sync:
+                for idx, (fname, label) in enumerate(files_to_sync):
+                    self.status_text = f"Загрузка: {label}..."
+                    self.progress = min(0.92, (idx + 0.35) / total)
                     url = f"{self.RAW_BASE}/{fname}?t={int(time.time())}"
                     resp = client.get(url)
                     if resp.status_code == 200 and len(resp.content) > 20:
@@ -1224,13 +1376,16 @@ class GitHubUpdater:
                         with open(dest, "wb") as f:
                             f.write(resp.content)
                         updated_count += 1
+                    self.progress = min(0.96, (idx + 1.0) / total)
+                    time.sleep(0.24)
 
             if updated_count > 0:
+                self.progress = 1.0
                 self.local_version = self._read_local_version()
+                self.update_available = False
                 self.status = "updated"
-                self.status_text = f"Обновлено до v{self.local_version}! Перезапуск..."
-                time.sleep(0.9)
-                # Spawn fresh detached process and exit current one
+                self.status_text = f"Обновлено до v{self.local_version} · Перезапуск..."
+                time.sleep(0.75)
                 vbs = os.path.join(APP_DIR, "Start_Dynamic_Island.vbs")
                 if os.path.exists(vbs):
                     subprocess.Popen(["wscript.exe", vbs], cwd=APP_DIR)
@@ -1240,9 +1395,11 @@ class GitHubUpdater:
                 os._exit(0)
             else:
                 self.status = "error"
-                self.status_text = "Файлы на GitHub ещё не опубликованы"
+                self.progress = 0.0
+                self.status_text = "Не удалось получить пакет обновления"
         except Exception:
             self.status = "error"
-            self.status_text = "Ошибка сети при загрузке с GitHub"
+            self.progress = 0.0
+            self.status_text = "Ошибка соединения при загрузке"
 
 
