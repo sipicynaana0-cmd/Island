@@ -907,8 +907,10 @@ class DynamicIslandWidget(QWidget):
         self.active_tab = 0
         self.sp_tab_trans = SpringValue(1.0, stiffness=420.0, damping=34.0)
         self.tab_open_sp: List[SpringValue] = [
-            SpringValue(1.0 if i == 0 else 0.0, stiffness=460.0, damping=34.0) for i in range(7)
+            SpringValue(1.0 if i == 0 else 0.0, stiffness=460.0, damping=34.0) for i in range(8)
         ]
+        self.is_updating_collapse = False
+        self.sp_update_prog = SpringValue(0.0, stiffness=180.0, damping=26.0)
 
         self.character_mode = 2
         self._blink_timer = 0.0
@@ -1134,16 +1136,30 @@ class DynamicIslandWidget(QWidget):
         now = time.monotonic()
         track, _ = self.media.get_snapshot()
         has_media = bool(track.is_playing or track.title)
-        expanded = (self.is_hovered or self.is_pinned_open or self.is_drag_hover) and not self.game_mode_locked
-        osd_active = (now < self._osd_until) and not expanded
+        updating_now = self.is_updating_collapse or self.updater.status in ("downloading", "updated")
+        if self.updater.status == "error":
+            self.is_updating_collapse = False
+            updating_now = False
+
+        expanded = (
+            (self.is_hovered or self.is_pinned_open or self.is_drag_hover)
+            and not self.game_mode_locked
+            and not updating_now
+        )
+        osd_active = (now < self._osd_until) and not expanded and not updating_now
 
         self.sp_osd.set_target(1.0 if osd_active else 0.0)
         self.sp_cascade.set_target(1.0 if expanded else 0.0)
 
-        for i in range(7):
+        for i in range(8):
             self.tab_open_sp[i].set_target(1.0 if i == self.active_tab else 0.0)
 
-        if expanded:
+        if updating_now:
+            self.sp_w.set_target(368.0, stiffness=340.0, damping=32.0)
+            self.sp_h.set_target(52.0, stiffness=340.0, damping=32.0)
+            self.sp_r.set_target(24.0)
+            self.sp_expand.set_target(0.0)
+        elif expanded:
             self.sp_w.set_target(self.EXPANDED_W, stiffness=380.0, damping=34.0)
             self.sp_h.set_target(self.EXPANDED_H, stiffness=380.0, damping=34.0)
             self.sp_r.set_target(28.0)
@@ -1172,7 +1188,7 @@ class DynamicIslandWidget(QWidget):
     def _on_fast_watch(self):
         now = time.monotonic()
 
-        if not self.game_mode_locked:
+        if not self.game_mode_locked and not self.is_updating_collapse and self.updater.status not in ("downloading", "updated"):
             local_pos = QPointF(self.mapFromGlobal(QCursor.pos()))
             cap = self.current_capsule_rect()
 
@@ -1300,6 +1316,8 @@ class DynamicIslandWidget(QWidget):
         self.sp_ferro_pull.step(dt)
         self.sp_ferro_x.step(dt)
         self.sp_tab_trans.step(dt)
+        self.sp_update_prog.set_target(self.updater.progress)
+        self.sp_update_prog.step(dt)
         for sp_t in self.tab_open_sp:
             sp_t.step(dt)
 
@@ -1511,8 +1529,18 @@ class DynamicIslandWidget(QWidget):
             self.likes_mgr.toggle_dislike(track.title, track.artist)
             self.media.next_track()
             self._trigger_osd("drop", "Не нравится · Пропуск трека", duration=1.35)
+        elif key == "top_updates":
+            self.legal_doc_mode = ""
+            self._switch_to_tab(7)
         elif key == "btn_github_update":
-            self.updater.install_update_async()
+            if self.updater.update_available:
+                self.is_updating_collapse = True
+                self.is_pinned_open = False
+                self.is_hovered = False
+                self.sp_update_prog.value = 0.02
+                self.updater.install_update_async()
+                self._update_target_dimensions()
+                self._ensure_anim_running()
         elif key == "btn_github_check":
             self.updater.check_async()
         elif key == "btn_open_privacy":
@@ -1903,6 +1931,7 @@ class DynamicIslandWidget(QWidget):
                 4: lambda painter: self._paint_tab_note(painter, cap, content_top, accent_col),
                 5: lambda painter: self._paint_tab_weather(painter, cap, content_top, accent_col),
                 6: lambda painter: self._paint_tab_controls(painter, cap, content_top, accent_col),
+                7: lambda painter: self._paint_tab_updates(painter, cap, content_top, accent_col),
             }
 
             # Direct A -> B transition (Never flies across intermediate tabs!)
@@ -1965,6 +1994,50 @@ class DynamicIslandWidget(QWidget):
     ):
         cy = cap.height() * 0.48
         w_data = self.weather_worker.data
+
+        # Dedicated Collapsed Update Loading Bar State (when user clicks 'Обновить')!
+        if self.is_updating_collapse or self.updater.status in ("downloading", "updated"):
+            prog = clamp(self.sp_update_prog.value, 0.02, 1.0)
+            pct = int(round(prog * 100))
+
+            ic_pt = QPointF(cap.left() + 22.0, cap.top() + 17.5)
+            p.save()
+            p.translate(ic_pt)
+            p.rotate((self._wave_phase * 42.0) % 360.0)
+            p.translate(-ic_pt)
+            VectorIcons.draw_refresh(p, ic_pt, 13.5, accent_col)
+            p.restore()
+
+            p.setPen(QColor(255, 255, 255, 248))
+            p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+            p.drawText(
+                QRectF(cap.left() + 36.0, cap.top() + 7.0, cap.width() - 92.0, 20.0),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                self.updater.status_text,
+            )
+
+            p.setPen(accent_col)
+            p.setFont(QFont("Segoe UI Variable Display", 9, QFont.Weight.Bold))
+            p.drawText(
+                QRectF(cap.right() - 56.0, cap.top() + 7.0, 38.0, 20.0),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                f"{pct}%",
+            )
+
+            bar_bg = QRectF(cap.left() + 18.0, cap.bottom() - 15.5, cap.width() - 36.0, 6.5)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(30, 30, 38, 255))
+            p.drawRoundedRect(bar_bg, 3.25, 3.25)
+
+            fill_w = max(8.0, bar_bg.width() * prog)
+            fill_r = QRectF(bar_bg.left(), bar_bg.top(), fill_w, bar_bg.height())
+            p_grad = QLinearGradient(fill_r.topLeft(), fill_r.topRight())
+            p_grad.setColorAt(0.0, accent_col)
+            p_grad.setColorAt(0.65, QColor(244, 114, 182, 255))
+            p_grad.setColorAt(1.0, QColor(142, 162, 255, 255))
+            p.setBrush(QBrush(p_grad))
+            p.drawRoundedRect(fill_r, 3.25, 3.25)
+            return
 
         if track.is_playing or track.title:
             art_r = QRectF(cap.left() + 12.0, cy - 12.0, 24.0, 24.0)
@@ -2240,7 +2313,6 @@ class DynamicIslandWidget(QWidget):
         for key, draw_fn, is_circle_active in (
             ("top_mixer", VectorIcons.draw_sliders_h, self.show_inline_mixer),
             ("top_pin", VectorIcons.draw_pushpin, self.is_pinned_open),
-            ("top_char", VectorIcons.draw_voice_bars, False),
         ):
             right_x -= 32.0
             brect = QRectF(right_x, ty + 1.0, 30.0, 30.0)
@@ -2265,6 +2337,75 @@ class DynamicIslandWidget(QWidget):
             draw_fn(p, brect.center(), 14.0, ic_col)
             p.restore()
             right_x -= 6.0
+
+        # Dedicated Updates Tab right next to Pin ('Закрепить')!
+        upd_open_t = clamp(self.tab_open_sp[7].value, 0.0, 1.0)
+        hu_top, pu_top = self._get_btn_springs("top_updates")
+        has_upd = self.updater.update_available
+        pill_open = max(upd_open_t, 1.0 if has_upd else 0.0)
+        upd_w = lerp(30.0, 108.0, pill_open)
+        right_x -= upd_w
+        urect = QRectF(right_x, ty + 1.0, upd_w, 30.0)
+        self._hitboxes["top_updates"] = urect
+
+        p.save()
+        sc_u = 1.0 + hu_top.value * 0.06 - pu_top.value * 0.08
+        p.translate(urect.center())
+        p.scale(sc_u, sc_u)
+        p.translate(-urect.center())
+        if self.active_tab == 7 or has_upd or hu_top.value > 0.04:
+            p.setPen(
+                QPen(
+                    accent_col if has_upd else QColor(255, 255, 255, int(lerp(18, 42, max(upd_open_t, hu_top.value)))),
+                    1.1,
+                )
+            )
+            p.setBrush(
+                QColor(44, 24, 34, 245)
+                if has_upd
+                else QColor(36, 36, 44, int(max(upd_open_t * 255, hu_top.value * 215, 175)))
+            )
+        else:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(26, 26, 32, 185))
+        p.drawRoundedRect(urect, 15.0, 15.0)
+
+        ic_ux = lerp(urect.center().x(), urect.left() + 15.5, pill_open)
+        VectorIcons.draw_refresh(
+            p,
+            QPointF(ic_ux, urect.center().y()),
+            13.5,
+            accent_col if has_upd else QColor(255, 255, 255, 248 if self.active_tab == 7 else 210),
+        )
+        if pill_open > 0.15:
+            p.save()
+            p.setClipRect(urect.adjusted(24, 0, -4, 0))
+            p.setOpacity(clamp((pill_open - 0.15) / 0.7))
+            p.setPen(QColor(255, 255, 255, 252))
+            p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+            p.drawText(
+                urect.adjusted(27, 0, -6, 0),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                "Обновления",
+            )
+            p.restore()
+        if has_upd:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(accent_col)
+            p.drawEllipse(QPointF(urect.right() - 8.5, urect.top() + 8.0), 3.2, 3.2)
+        p.restore()
+        right_x -= 6.0
+
+        # Character switcher button to the left of Updates tab
+        right_x -= 32.0
+        crect_top = QRectF(right_x, ty + 1.0, 30.0, 30.0)
+        self._hitboxes["top_char"] = crect_top
+        hc_sp, _ = self._get_btn_springs("top_char")
+        if hc_sp.value > 0.05:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(28, 28, 34, int(hc_sp.value * 225)))
+            p.drawEllipse(crect_top)
+        VectorIcons.draw_voice_bars(p, crect_top.center(), 14.0, QColor(255, 255, 255, int(lerp(135, 248, hc_sp.value))))
 
     # --- TAB 0: ГЛАВНАЯ (Upgraded Player Card, Functional Volume Bar & Full Mixer!) ---
     def _paint_tab_home(
@@ -3245,9 +3386,9 @@ class DynamicIslandWidget(QWidget):
         p.setPen(QColor(220, 232, 250, 225))
         p.setFont(QFont("Segoe UI", 8, QFont.Weight.Medium))
         p.drawText(
-            QRectF(sky_card.left() + 18, sky_card.top() + 184, 168, 20),
+            QRectF(sky_card.left() + 18, sky_card.top() + 184, 172, 20),
             Qt.AlignmentFlag.AlignLeft,
-            f"Ощущается {w.feels_like}° · {w.temp - 2}°..{w.temp + 2}°",
+            f"Ощущается {w.feels_like}° · {w.temp_min}°..{w.temp_max}°",
         )
 
         # Automatic Location Badge inside Sky Card (Manual cities removed as requested!)
@@ -3259,7 +3400,7 @@ class DynamicIslandWidget(QWidget):
         VectorIcons.draw_location_pin(p, QPointF(auto_pill.left() + 15.0, auto_pill.center().y()), 12.5, QColor(125, 211, 252, 245))
         p.setPen(QColor(255, 255, 255, 248))
         p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-        p.drawText(auto_pill.adjusted(27, 0, -6, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "Автоопределение (IP)")
+        p.drawText(auto_pill.adjusted(27, 0, -6, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "Точная геолокация")
 
         # Frosted Bottom Summary Pill
         sum_pill = QRectF(sky_card.left() + 12, sky_card.bottom() - 74, sky_card.width() - 24, 44.0)
@@ -3330,13 +3471,14 @@ class DynamicIslandWidget(QWidget):
         # 3. Right Bottom 3x2 Grid of 6 High-Detail iOS-18 Weather Metric Tiles
         tw = (rw - 20.0) / 3.0
         th = 117.0
+        uv_lbl = "низкий" if w.uv_index <= 2 else ("средний" if w.uv_index <= 5 else "высокий")
         tiles_meta = [
             ("ВЕТЕР", f"{w.wind_speed} м/с", w.wind_dir_label, "wind"),
-            ("ВЛАЖНОСТЬ", f"{w.humidity}%", f"Роса {w.temp - 2}°", "hum"),
+            ("ВЛАЖНОСТЬ", f"{w.humidity}%", f"Точка росы {w.dew_point}°", "hum"),
             ("ДАВЛЕНИЕ", f"{w.pressure_mm}", "мм рт. ст.", "press"),
             ("СОЛНЦЕ", f"{w.sunrise}", f"{w.sunset}", "sun"),
             ("ОСАДКИ", f"{w.precipitation_mm}", "мм / сут", "prec"),
-            ("УФ-ИНДЕКС", f"{w.uv_index}", "низкий", "uv"),
+            ("УФ-ИНДЕКС", f"{w.uv_index}", uv_lbl, "uv"),
         ]
         for idx, (mtitle, mval, msub, mkind) in enumerate(tiles_meta):
             ci = idx % 3
@@ -3459,68 +3601,14 @@ class DynamicIslandWidget(QWidget):
                 p.setFont(QFont("Segoe UI", 7))
                 p.drawText(QRectF(tx + 12, ty + 90, tw - 24, 16), Qt.AlignmentFlag.AlignLeft, "Защита не требуется")
 
-    # --- TAB 6: УПРАВЛЕНИЕ + ОБНОВЛЕНИЯ С GITHUB + ПОЛИТИКА И СОГЛАСИЕ ---
+    # --- TAB 6: УПРАВЛЕНИЕ (Чистая панель быстрых переключателей, телеметрии и питания) ---
     def _paint_tab_controls(self, p: QPainter, cap: QRectF, top: float, accent_col: QColor):
         left_x = cap.left() + 22.0
         w = cap.width() - 44.0
         periwinkle = QColor(142, 162, 255, 255)
 
-        # Full Legal Document Viewer Overlay inside Island when user clicks 'Политика' or 'Согласие'
-        if self.legal_doc_mode in ("privacy", "consent"):
-            doc_card = self._draw_obsidian_card(p, QRectF(left_x, top, w, 344.0), 18.0, cascade_order=0)
-            is_priv = self.legal_doc_mode == "privacy"
-            title_doc = "Политика конфиденциальности «Island»" if is_priv else "Согласие пользователя и условия «Island»"
-            raw_doc = self.consent_mgr.read_document("PRIVACY_POLICY.md" if is_priv else "USER_CONSENT.md")
-            clean_doc = re.sub(r"[#*>]", "", raw_doc).strip()
-
-            p.setPen(QColor(255, 255, 255, 252))
-            p.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-            p.drawText(QRectF(doc_card.left() + 18, doc_card.top() + 12, w - 120, 24), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, title_doc)
-
-            back_r = QRectF(doc_card.right() - 88, doc_card.top() + 11, 72, 26)
-            self._hitboxes["btn_close_legal"] = back_r
-            p.setPen(QPen(QColor(255, 255, 255, 35), 1.0))
-            p.setBrush(QColor(34, 34, 44, 255))
-            p.drawRoundedRect(back_r, 13.0, 13.0)
-            p.setPen(QColor(255, 255, 255, 245))
-            p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-            p.drawText(back_r, Qt.AlignmentFlag.AlignCenter, "Назад")
-
-            p.setPen(QColor(195, 195, 208, 240))
-            p.setFont(QFont("Segoe UI", 8))
-            p.drawText(
-                doc_card.adjusted(18, 42, -18, -54),
-                Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap,
-                clean_doc[:1180] + ("..." if len(clean_doc) > 1180 else ""),
-            )
-
-            # Bottom Consent Checkbox inside viewer (exact user formulation!)
-            chk_bar = QRectF(doc_card.left() + 14, doc_card.bottom() - 46, doc_card.width() - 28, 36)
-            self._hitboxes["btn_toggle_consent"] = chk_bar
-            p.setPen(QPen(QColor(142, 162, 255, 90 if self.consent_mgr.accepted else 30), 1.0))
-            p.setBrush(QColor(22, 24, 32, 255))
-            p.drawRoundedRect(chk_bar, 10.0, 10.0)
-
-            box_r = QRectF(chk_bar.left() + 10, chk_bar.center().y() - 7.5, 15.0, 15.0)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(periwinkle if self.consent_mgr.accepted else QColor(45, 45, 55))
-            p.drawRoundedRect(box_r, 4.0, 4.0)
-            if self.consent_mgr.accepted:
-                p.setPen(QPen(QColor(10, 10, 16), 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-                p.drawLine(QPointF(box_r.left() + 3.5, box_r.center().y()), QPointF(box_r.center().x() - 0.5, box_r.bottom() - 3.5))
-                p.drawLine(QPointF(box_r.center().x() - 0.5, box_r.bottom() - 3.5), QPointF(box_r.right() - 3.0, box_r.top() + 3.5))
-
-            p.setPen(QColor(235, 235, 245, 245))
-            p.setFont(QFont("Segoe UI", 7, QFont.Weight.DemiBold))
-            p.drawText(
-                chk_bar.adjusted(32, 0, -8, 0),
-                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                "Я ознакомился и принимаю Политику конфиденциальности и Согласие на использование «Island» (Local-First)",
-            )
-            return
-
         cw = (w - 30.0) / 4.0
-        ch = 104.0
+        ch = 122.0
         bat_pct = self.telemetry.battery_percent if self.telemetry.battery_percent is not None else 100
         top_cards = [
             ("ctrl_wifi", "Wi-Fi", "Включён" if self.wifi_enabled else "Выключен", self.wifi_enabled, VectorIcons.draw_wifi),
@@ -3547,77 +3635,77 @@ class DynamicIslandWidget(QWidget):
             )
             self._hitboxes[ckey] = crect
 
-            ic_c = QPointF(crect.left() + 28.0, crect.top() + 28.0)
+            ic_c = QPointF(crect.left() + 30.0, crect.top() + 34.0)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(periwinkle if is_on else QColor(38, 38, 46, 255))
-            p.drawEllipse(ic_c, 18.0, 18.0)
+            p.drawEllipse(ic_c, 19.5, 19.5)
 
             ic_col = QColor(10, 10, 16, 255) if is_on else QColor(225, 225, 235, 240)
-            ic_fn(p, ic_c, 16.0, ic_col)
+            ic_fn(p, ic_c, 16.5, ic_col)
 
             p.setPen(QColor(255, 255, 255, 252))
             p.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-            p.drawText(QRectF(crect.left() + 14, crect.top() + 56, cw - 20, 20), Qt.AlignmentFlag.AlignLeft, ctitle)
+            p.drawText(QRectF(crect.left() + 16, crect.top() + 68, cw - 24, 20), Qt.AlignmentFlag.AlignLeft, ctitle)
             p.setPen(QColor(145, 145, 155, 230))
             p.setFont(QFont("Segoe UI", 8, QFont.Weight.Medium))
-            p.drawText(QRectF(crect.left() + 14, crect.top() + 76, cw - 20, 16), Qt.AlignmentFlag.AlignLeft, csub)
+            p.drawText(QRectF(crect.left() + 16, crect.top() + 90, cw - 24, 18), Qt.AlignmentFlag.AlignLeft, csub)
 
-        mid_y = top + ch + 8.0
+        mid_y = top + ch + 12.0
         tel_w = w * 0.56
-        tel_r = self._draw_obsidian_card(p, QRectF(left_x, mid_y, tel_w, 54.0), 14.0, cascade_order=3)
+        tel_r = self._draw_obsidian_card(p, QRectF(left_x, mid_y, tel_w, 82.0), 16.0, cascade_order=3)
 
         gauges = [
             (f"{self.telemetry.cpu_percent} %", "Процессор", self.telemetry.cpu_percent / 100.0),
             (f"{self.telemetry.ram_percent} %", "Память", self.telemetry.ram_percent / 100.0),
             (f"{self.telemetry.gpu_percent} %", "Видеокарта", self.telemetry.gpu_percent / 100.0),
         ]
-        gx = tel_r.left() + 14.0
-        ty_m = tel_r.top()
+        gx = tel_r.left() + 16.0
+        ty_m = tel_r.top() + 12.0
         for gval, glbl, grat in gauges:
             p.setPen(QColor(255, 255, 255, 250))
-            p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-            p.drawText(QRectF(gx, ty_m + 6, 70, 16), Qt.AlignmentFlag.AlignLeft, gval)
+            p.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+            p.drawText(QRectF(gx, ty_m + 2, 72, 18), Qt.AlignmentFlag.AlignLeft, gval)
 
-            gbar = QRectF(gx, ty_m + 25, 72.0, 4.5)
+            gbar = QRectF(gx, ty_m + 26, 74.0, 5.5)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(42, 42, 50, 255))
-            p.drawRoundedRect(gbar, 2.2, 2.2)
+            p.drawRoundedRect(gbar, 2.7, 2.7)
             p.setBrush(periwinkle)
-            p.drawRoundedRect(QRectF(gbar.left(), gbar.top(), gbar.width() * clamp(grat), 4.5), 2.2, 2.2)
+            p.drawRoundedRect(QRectF(gbar.left(), gbar.top(), gbar.width() * clamp(grat), 5.5), 2.7, 2.7)
 
             p.setPen(QColor(135, 135, 145, 225))
             p.setFont(QFont("Segoe UI", 7))
-            p.drawText(QRectF(gx, ty_m + 33, 75, 15), Qt.AlignmentFlag.AlignLeft, glbl)
-            gx += 86.0
+            p.drawText(QRectF(gx, ty_m + 37, 76, 16), Qt.AlignmentFlag.AlignLeft, glbl)
+            gx += 88.0
 
         p.setPen(QColor(255, 255, 255, 248))
         p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-        p.drawText(QRectF(gx, ty_m + 6, 100, 15), Qt.AlignmentFlag.AlignLeft, f"{self.telemetry.net_down_str}")
+        p.drawText(QRectF(gx, ty_m + 4, 102, 16), Qt.AlignmentFlag.AlignLeft, f"{self.telemetry.net_down_str}")
         p.setPen(QColor(145, 145, 155, 225))
         p.setFont(QFont("Segoe UI", 7))
-        p.drawText(QRectF(gx, ty_m + 20, 100, 14), Qt.AlignmentFlag.AlignLeft, f"{self.telemetry.net_up_str}")
-        p.drawText(QRectF(gx, ty_m + 34, 100, 14), Qt.AlignmentFlag.AlignLeft, "Сеть")
+        p.drawText(QRectF(gx, ty_m + 21, 102, 15), Qt.AlignmentFlag.AlignLeft, f"{self.telemetry.net_up_str}")
+        p.drawText(QRectF(gx, ty_m + 37, 102, 15), Qt.AlignmentFlag.AlignLeft, "Сеть")
 
-        br_r = self._draw_obsidian_card(p, QRectF(tel_r.right() + 10.0, mid_y, w - tel_w - 10.0, 54.0), 14.0, cascade_order=4)
-        VectorIcons.draw_sun(p, QPointF(br_r.left() + 22.0, br_r.center().y()), 15.0, QColor(215, 215, 225, 235))
+        br_r = self._draw_obsidian_card(p, QRectF(tel_r.right() + 10.0, mid_y, w - tel_w - 10.0, 82.0), 16.0, cascade_order=4)
+        VectorIcons.draw_sun(p, QPointF(br_r.left() + 24.0, br_r.center().y()), 16.0, QColor(215, 215, 225, 235))
 
         p.setPen(QColor(155, 155, 165, 230))
         p.setFont(QFont("Segoe UI", 8, QFont.Weight.Medium))
-        p.drawText(QRectF(br_r.left() + 42, br_r.top() + 8, 140, 16), Qt.AlignmentFlag.AlignLeft, "Яркость монитора")
-        p.drawText(QRectF(br_r.right() - 55, br_r.top() + 8, 40, 16), Qt.AlignmentFlag.AlignRight, f"{self.dimmer_overlay.brightness_pct} %")
+        p.drawText(QRectF(br_r.left() + 46, br_r.top() + 18, 145, 18), Qt.AlignmentFlag.AlignLeft, "Яркость монитора")
+        p.drawText(QRectF(br_r.right() - 58, br_r.top() + 18, 42, 18), Qt.AlignmentFlag.AlignRight, f"{self.dimmer_overlay.brightness_pct} %")
 
-        b_bar = QRectF(br_r.left() + 42.0, br_r.top() + 31.0, br_r.width() - 58.0, 5.0)
+        b_bar = QRectF(br_r.left() + 46.0, br_r.top() + 46.0, br_r.width() - 62.0, 6.0)
         self._hitboxes["slider_bright"] = b_bar.adjusted(0, -10, 0, 10)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(42, 42, 50, 255))
-        p.drawRoundedRect(b_bar, 2.5, 2.5)
+        p.drawRoundedRect(b_bar, 3.0, 3.0)
         b_rat = clamp((self.dimmer_overlay.brightness_pct - 20) / 80.0)
         p.setBrush(QColor(235, 195, 38, 255))
-        p.drawRoundedRect(QRectF(b_bar.left(), b_bar.top(), b_bar.width() * b_rat, 5.0), 2.5, 2.5)
+        p.drawRoundedRect(QRectF(b_bar.left(), b_bar.top(), b_bar.width() * b_rat, 6.0), 3.0, 3.0)
 
         # Row 3: Power Action Cards (Блокировка, Сон, Перезагрузка, Выключение)
-        py = mid_y + 62.0
-        ph = 66.0
+        py = mid_y + 94.0
+        ph = 112.0
         now = time.monotonic()
         pwr_specs = [
             ("pwr_lock", "Блокировка", VectorIcons.draw_padlock),
@@ -3632,7 +3720,7 @@ class DynamicIslandWidget(QWidget):
             prect = self._draw_obsidian_card(
                 p,
                 QRectF(px, py, cw, ph),
-                14.0,
+                16.0,
                 cascade_order=idx + 4,
                 hovered_t=h_sp.value,
                 active_border=QColor(235, 85, 100, 195) if confirming else None,
@@ -3640,65 +3728,261 @@ class DynamicIslandWidget(QWidget):
             )
             self._hitboxes[pkey] = prect
 
-            p_icon(p, QPointF(prect.center().x(), prect.top() + 21.0), 15.0, QColor(195, 195, 205, 240))
+            p_icon(p, QPointF(prect.center().x(), prect.top() + 38.0), 17.0, QColor(205, 205, 215, 240))
             p.setPen(QColor(255, 255, 255, 248))
-            p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+            p.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
             txt_lbl = "Нажми ещё раз" if confirming else plbl
-            p.drawText(QRectF(prect.left(), prect.top() + 36, cw, 22), Qt.AlignmentFlag.AlignCenter, txt_lbl)
+            p.drawText(QRectF(prect.left(), prect.top() + 66, cw, 22), Qt.AlignmentFlag.AlignCenter, txt_lbl)
 
-        # Row 4: GitHub Auto-Update Bar + Privacy Policy & User Consent Buttons!
-        uy = py + ph + 8.0
-        upd_card = self._draw_obsidian_card(p, QRectF(left_x, uy, w, 48.0), 14.0, cascade_order=7)
+    # --- TAB 7: ОТДЕЛЬНАЯ ВКЛАДКА ОБНОВЛЕНИЙ (Рядом с Закрепить) ---
+    def _paint_tab_updates(self, p: QPainter, cap: QRectF, top: float, accent_col: QColor):
+        left_x = cap.left() + 22.0
+        w = cap.width() - 44.0
+        periwinkle = QColor(142, 162, 255, 255)
 
-        VectorIcons.draw_refresh(p, QPointF(upd_card.left() + 22.0, upd_card.center().y()), 15.0, accent_col)
-        p.setPen(QColor(255, 255, 255, 250))
+        # Full Legal Document Viewer Overlay inside Updates tab when user clicks 'Политика' or 'Согласие'
+        if self.legal_doc_mode in ("privacy", "consent"):
+            doc_card = self._draw_obsidian_card(p, QRectF(left_x, top, w, 342.0), 18.0, cascade_order=0)
+            is_priv = self.legal_doc_mode == "privacy"
+            title_doc = "Политика конфиденциальности «Island»" if is_priv else "Согласие пользователя и условия «Island»"
+            raw_doc = self.consent_mgr.read_document("PRIVACY_POLICY.md" if is_priv else "USER_CONSENT.md")
+            clean_doc = re.sub(r"[#*>]", "", raw_doc).strip()
+
+            p.setPen(QColor(255, 255, 255, 252))
+            p.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            p.drawText(
+                QRectF(doc_card.left() + 18, doc_card.top() + 12, w - 120, 24),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                title_doc,
+            )
+
+            back_r = QRectF(doc_card.right() - 88, doc_card.top() + 11, 72, 26)
+            self._hitboxes["btn_close_legal"] = back_r
+            p.setPen(QPen(QColor(255, 255, 255, 35), 1.0))
+            p.setBrush(QColor(34, 34, 44, 255))
+            p.drawRoundedRect(back_r, 13.0, 13.0)
+            p.setPen(QColor(255, 255, 255, 245))
+            p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+            p.drawText(back_r, Qt.AlignmentFlag.AlignCenter, "Назад")
+
+            p.setPen(QColor(195, 195, 208, 240))
+            p.setFont(QFont("Segoe UI", 8))
+            p.drawText(
+                doc_card.adjusted(18, 42, -18, -54),
+                Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap,
+                clean_doc[:1180] + ("..." if len(clean_doc) > 1180 else ""),
+            )
+
+            chk_bar = QRectF(doc_card.left() + 14, doc_card.bottom() - 46, doc_card.width() - 28, 36)
+            self._hitboxes["btn_toggle_consent"] = chk_bar
+            p.setPen(QPen(QColor(142, 162, 255, 90 if self.consent_mgr.accepted else 30), 1.0))
+            p.setBrush(QColor(22, 24, 32, 255))
+            p.drawRoundedRect(chk_bar, 10.0, 10.0)
+
+            box_r = QRectF(chk_bar.left() + 10, chk_bar.center().y() - 7.5, 15.0, 15.0)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(periwinkle if self.consent_mgr.accepted else QColor(45, 45, 55))
+            p.drawRoundedRect(box_r, 4.0, 4.0)
+            if self.consent_mgr.accepted:
+                p.setPen(QPen(QColor(10, 10, 16), 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.drawLine(QPointF(box_r.left() + 3.5, box_r.center().y()), QPointF(box_r.center().x() - 0.5, box_r.bottom() - 3.5))
+                p.drawLine(QPointF(box_r.center().x() - 0.5, box_r.bottom() - 3.5), QPointF(box_r.right() - 3.0, box_r.top() + 3.5))
+
+            p.setPen(QColor(235, 235, 245, 245))
+            p.setFont(QFont("Segoe UI", 7, QFont.Weight.DemiBold))
+            p.drawText(
+                chk_bar.adjusted(32, 0, -8, 0),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                "Я ознакомился и принимаю Политику конфиденциальности и Согласие на использование «Island» (Local-First)",
+            )
+            return
+
+        # 1. Left Status & Action Column (236 x 342 px)
+        has_upd = self.updater.update_available
+        l_card = self._draw_obsidian_card(
+            p,
+            QRectF(left_x, top, 236.0, 342.0),
+            18.0,
+            cascade_order=0,
+            active_border=QColor(accent_col.red(), accent_col.green(), accent_col.blue(), 110) if has_upd else None,
+        )
+
+        # Glowing central emblem inside Left Card
+        orb_pt = QPointF(l_card.center().x(), l_card.top() + 58.0)
+        glow_r = QRadialGradient(orb_pt, 46.0)
+        if has_upd:
+            glow_r.setColorAt(0.0, QColor(accent_col.red(), accent_col.green(), accent_col.blue(), 115))
+            glow_r.setColorAt(1.0, QColor(accent_col.red(), accent_col.green(), accent_col.blue(), 0))
+        else:
+            glow_r.setColorAt(0.0, QColor(74, 222, 128, 85))
+            glow_r.setColorAt(1.0, QColor(74, 222, 128, 0))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(glow_r))
+        p.drawEllipse(orb_pt, 46.0, 46.0)
+
+        p.setPen(QPen(accent_col if has_upd else QColor(74, 222, 128, 165), 1.4))
+        p.setBrush(QColor(22, 22, 28, 255))
+        p.drawEllipse(orb_pt, 24.0, 24.0)
+        VectorIcons.draw_refresh(
+            p,
+            orb_pt,
+            20.0,
+            accent_col if has_upd else QColor(74, 222, 128, 245),
+        )
+
+        p.setPen(QColor(255, 255, 255, 252))
+        p.setFont(QFont("Segoe UI Variable Display", 13, QFont.Weight.Bold))
+        p.drawText(
+            QRectF(l_card.left() + 14, l_card.top() + 94, l_card.width() - 28, 24),
+            Qt.AlignmentFlag.AlignCenter,
+            f"Island v{self.updater.local_version}",
+        )
+
+        status_pill = QRectF(l_card.left() + 22, l_card.top() + 124, l_card.width() - 44, 26)
+        p.setPen(
+            QPen(
+                accent_col if has_upd else QColor(74, 222, 128, 110),
+                1.0,
+            )
+        )
+        p.setBrush(QColor(42, 20, 30, 195) if has_upd else QColor(18, 38, 28, 185))
+        p.drawRoundedRect(status_pill, 13.0, 13.0)
+        p.setPen(QColor(255, 220, 235) if has_upd else QColor(167, 243, 208))
         p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         p.drawText(
-            QRectF(upd_card.left() + 38.0, upd_card.top() + 7.0, 265.0, 17.0),
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            self.updater.status_text,
-        )
-        p.setPen(QColor(145, 145, 158, 225))
-        p.setFont(QFont("Segoe UI", 7))
-        p.drawText(
-            QRectF(upd_card.left() + 38.0, upd_card.top() + 25.0, 265.0, 15.0),
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            f"GitHub: {GitHubUpdater.REPO_SLUG} · Автообновление",
+            status_pill,
+            Qt.AlignmentFlag.AlignCenter,
+            f"Доступна версия v{self.updater.remote_version}" if has_upd else "Актуальная версия",
         )
 
-        # Glowing 'Обновить' button + 'Политика' + 'Согласие' buttons
-        btn_upd = QRectF(upd_card.right() - 324.0, upd_card.center().y() - 14.0, 106.0, 28.0)
-        btn_priv = QRectF(upd_card.right() - 210.0, upd_card.center().y() - 14.0, 96.0, 28.0)
-        btn_cons = QRectF(upd_card.right() - 106.0, upd_card.center().y() - 14.0, 96.0, 28.0)
-        self._hitboxes["btn_github_update"] = btn_upd
+        p.setPen(QColor(155, 155, 168, 230))
+        p.setFont(QFont("Segoe UI", 8))
+        desc_status = (
+            "При нажатии «Обновить» Остров плавно свернётся в шкалу загрузки и перезапустится."
+            if has_upd
+            else "Установлены все последние улучшения интерфейса, плеера и погоды."
+        )
+        p.drawText(
+            QRectF(l_card.left() + 16, l_card.top() + 158, l_card.width() - 32, 48),
+            Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+            desc_status,
+        )
+
+        # Conditional 'Обновить' Button: ONLY shown when an update is actually available!
+        act_btn = QRectF(l_card.left() + 18, l_card.top() + 214, l_card.width() - 36, 38)
+        if has_upd:
+            self._hitboxes["btn_github_update"] = act_btn
+            hu, _ = self._get_btn_springs("btn_github_update")
+            p.setPen(Qt.PenStyle.NoPen)
+            btn_grad = QLinearGradient(act_btn.topLeft(), act_btn.topRight())
+            btn_grad.setColorAt(0.0, accent_col)
+            btn_grad.setColorAt(1.0, QColor(244, 114, 182, 255))
+            p.setBrush(QBrush(btn_grad))
+            p.drawRoundedRect(act_btn, 12.0, 12.0)
+            p.setPen(QColor(255, 255, 255, 255))
+            p.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+            p.drawText(act_btn, Qt.AlignmentFlag.AlignCenter, f"Обновить до v{self.updater.remote_version}")
+        else:
+            self._hitboxes["btn_github_check"] = act_btn
+            hc, _ = self._get_btn_springs("btn_github_check")
+            p.setPen(QPen(QColor(255, 255, 255, int(lerp(24, 58, hc.value))), 1.0))
+            p.setBrush(QColor(26, 26, 34, 255))
+            p.drawRoundedRect(act_btn, 12.0, 12.0)
+            p.setPen(QColor(225, 225, 235, 245))
+            p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+            p.drawText(act_btn, Qt.AlignmentFlag.AlignCenter, "Проверить обновления")
+
+        # Bottom Legal Buttons ('Политика' and 'Согласие')
+        bw_leg = (l_card.width() - 44.0) * 0.5
+        btn_priv = QRectF(l_card.left() + 18.0, l_card.bottom() - 44.0, bw_leg, 30.0)
+        btn_cons = QRectF(btn_priv.right() + 8.0, l_card.bottom() - 44.0, bw_leg, 30.0)
         self._hitboxes["btn_open_privacy"] = btn_priv
         self._hitboxes["btn_open_consent"] = btn_cons
-
-        hu, _ = self._get_btn_springs("btn_github_update")
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(accent_col if hu.value > 0.1 else QColor(236, 72, 128, 230))
-        p.drawRoundedRect(btn_upd, 9.0, 9.0)
-        p.setPen(QColor(255, 255, 255, 255))
-        p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-        p.drawText(btn_upd, Qt.AlignmentFlag.AlignCenter, "Обновить")
 
         for b_key, b_rect, b_lbl in (
             ("btn_open_privacy", btn_priv, "Политика"),
             ("btn_open_consent", btn_cons, "Согласие"),
         ):
             hb, _ = self._get_btn_springs(b_key)
-            p.setPen(QPen(QColor(255, 255, 255, int(lerp(22, 60, hb.value))), 1.0))
-            p.setBrush(QColor(26, 26, 34, 255))
-            p.drawRoundedRect(b_rect, 9.0, 9.0)
+            p.setPen(QPen(QColor(255, 255, 255, int(lerp(20, 55, hb.value))), 1.0))
+            p.setBrush(QColor(24, 24, 30, 255))
+            p.drawRoundedRect(b_rect, 9.5, 9.5)
             if b_key == "btn_open_consent":
-                dot_c = QPointF(b_rect.left() + 14.0, b_rect.center().y())
+                dot_c = QPointF(b_rect.left() + 12.0, b_rect.center().y())
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QColor(74, 222, 128) if self.consent_mgr.accepted else QColor(148, 163, 184))
-                p.drawEllipse(dot_c, 3.0, 3.0)
-                p.setPen(QColor(230, 230, 240, 245))
+                p.drawEllipse(dot_c, 2.8, 2.8)
+                p.setPen(QColor(225, 225, 235, 240))
                 p.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
-                p.drawText(b_rect.adjusted(10, 0, 0, 0), Qt.AlignmentFlag.AlignCenter, b_lbl)
+                p.drawText(b_rect.adjusted(9, 0, 0, 0), Qt.AlignmentFlag.AlignCenter, b_lbl)
             else:
-                p.setPen(QColor(230, 230, 240, 245))
+                p.setPen(QColor(225, 225, 235, 240))
                 p.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
                 p.drawText(b_rect, Qt.AlignmentFlag.AlignCenter, b_lbl)
+
+        # 2. Right Changelog Menu ('Обновления, которые будут при перезапуске')
+        rx = l_card.right() + 12.0
+        rw = cap.right() - 22.0 - rx
+        r_card = self._draw_obsidian_card(p, QRectF(rx, top, rw, 342.0), 18.0, cascade_order=1)
+
+        p.setPen(QColor(255, 255, 255, 252))
+        p.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        hdr_txt = (
+            "Обновления, которые будут при перезапуске"
+            if has_upd
+            else "Список обновлений и изменений сборки"
+        )
+        p.drawText(
+            QRectF(r_card.left() + 18, r_card.top() + 14, rw - 96, 22),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            hdr_txt,
+        )
+
+        ver_badge = QRectF(r_card.right() - 78, r_card.top() + 13, 62, 22)
+        p.setPen(QPen(QColor(142, 162, 255, 90), 1.0))
+        p.setBrush(QColor(26, 28, 42, 255))
+        p.drawRoundedRect(ver_badge, 11.0, 11.0)
+        p.setPen(periwinkle)
+        p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        p.drawText(ver_badge, Qt.AlignmentFlag.AlignCenter, f"v{self.updater.remote_version}")
+
+        iy = r_card.top() + 46.0
+        tag_colors = {
+            "Погода": (QColor(56, 189, 248, 240), QColor(18, 38, 54, 230)),
+            "Анимация": (QColor(244, 114, 182, 245), QColor(46, 20, 36, 230)),
+            "Интерфейс": (QColor(142, 162, 255, 245), QColor(24, 28, 48, 230)),
+            "Плеер": (QColor(74, 222, 128, 245), QColor(18, 40, 28, 230)),
+        }
+
+        for idx, item in enumerate(self.updater.changelog[:4]):
+            item_r = QRectF(r_card.left() + 14.0, iy, rw - 28.0, 66.0)
+            p.setPen(QPen(QColor(255, 255, 255, 18), 1.0))
+            p.setBrush(QColor(20, 20, 26, 245))
+            p.drawRoundedRect(item_r, 13.0, 13.0)
+
+            tag_lbl = item.get("tag", "Модуль")
+            fg_t, bg_t = tag_colors.get(tag_lbl, (periwinkle, QColor(26, 28, 42, 230)))
+            tag_r = QRectF(item_r.left() + 12.0, item_r.top() + 10.0, 72.0, 18.0)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(bg_t)
+            p.drawRoundedRect(tag_r, 9.0, 9.0)
+            p.setPen(fg_t)
+            p.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+            p.drawText(tag_r, Qt.AlignmentFlag.AlignCenter, tag_lbl)
+
+            p.setPen(QColor(255, 255, 255, 250))
+            p.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+            p.drawText(
+                QRectF(tag_r.right() + 10.0, item_r.top() + 9.0, item_r.width() - 92.0, 20.0),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                item.get("title", ""),
+            )
+
+            p.setPen(QColor(165, 165, 178, 235))
+            p.setFont(QFont("Segoe UI", 8))
+            p.drawText(
+                QRectF(item_r.left() + 12.0, item_r.top() + 31.0, item_r.width() - 24.0, 30.0),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
+                item.get("desc", ""),
+            )
+            iy += 72.0
