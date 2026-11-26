@@ -808,6 +808,14 @@ class VectorIcons:
         p.restore()
 
 
+def peak_from_bands(bands: List[float]) -> float:
+    """Kick-drum energy from the lowest spectrum bands (0..1)."""
+    if not bands:
+        return 0.0
+    low = bands[:5]
+    return max(low) * 0.6 + (sum(low) / len(low)) * 0.4
+
+
 def make_rounded_pixmap(img_bytes: Optional[bytes], size: int, radius: int) -> Optional[QPixmap]:
     if not img_bytes:
         return None
@@ -1350,8 +1358,8 @@ class DynamicIslandWidget(QWidget):
                 self._is_blinking = False
                 self._blink_timer = random.uniform(-0.8, 0.4)
 
-        self._wave_phase = (self._wave_phase + dt * (8.5 if track.is_playing else 2.8)) % (math.pi * 40.0)
-        self._aurora_phase = (self._aurora_phase + dt * (1.9 if track.is_playing else 0.75)) % (math.pi * 20.0)
+        self._wave_phase = (self._wave_phase + dt * (1.2 + peak * 18.0 if track.is_playing else 0.0)) % (math.pi * 40.0)
+        self._aurora_phase = (self._aurora_phase + dt * (0.8 + peak * 2.4 if track.is_playing else 0.45)) % (math.pi * 20.0)
         if track.is_playing:
             self._vinyl_angle = (self._vinyl_angle + 88.0 * dt) % 360.0
         if track.title:
@@ -1364,6 +1372,26 @@ class DynamicIslandWidget(QWidget):
 
         if self.sp_expand.value > 0.3:
             self._app_sessions = self.audio.get_app_sessions()
+
+        # Adaptive frame rate: full 120 FPS while anything moves or music plays, 30 FPS when idle
+        moving = (
+            abs(self.sp_w.velocity) > 0.4
+            or abs(self.sp_h.velocity) > 0.4
+            or abs(self.sp_expand.velocity) > 0.01
+            or abs(self.sp_ferro_pull.velocity) > 0.05
+            or self.sp_ferro_pull.value > 0.2
+        )
+        busy = (
+            moving
+            or track.is_playing
+            or self.sp_expand.value > 0.02
+            or self.sp_osd.value > 0.02
+            or self.is_updating_collapse
+            or self._ripples
+        )
+        want_iv = 8 if busy else 30
+        if self._anim_timer.interval() != want_iv:
+            self._anim_timer.setInterval(want_iv)
 
         self.update()
 
@@ -1632,9 +1660,6 @@ class DynamicIslandWidget(QWidget):
             self.timer_remaining_sec = 25 * 60.0
         elif key == "weather_refresh":
             self.weather_worker.refresh_async()
-        elif key.startswith("w_city_"):
-            c_idx = int(key.split("_")[-1])
-            self.weather_worker.select_city(c_idx)
         elif key == "ctrl_wifi":
             self.wifi_enabled = not self.wifi_enabled
             launch_shell_target("ms-settings:network-wifi")
@@ -1801,23 +1826,32 @@ class DynamicIslandWidget(QWidget):
         x_start = left + br + 4.0
         x_end = right - br - 4.0
         span = max(10.0, x_end - x_start)
-        num_pts = 30
+        num_pts = 36
         wave_pts: List[QPointF] = []
 
-        amp = lerp(2.8, 4.6, exp) * (0.45 + peak * 1.5)
-        freq = lerp(7.0, 13.0, exp)
+        # Audio-reactive liquid edge: strictly driven by real FFT spectrum bands & bass peak.
+        # When silent or paused (peak ~ 0), wave_dy is 0.0 so the edge stays completely still!
+        n_b = len(bands)
+        amp_max = lerp(7.0, 10.5, exp)
+        active_gate = clamp((peak - 0.012) / 0.05)
 
         for i in range(num_pts + 1):
             t = i / num_pts
             px = x_start + t * span
-            env = math.sin(t * math.pi)
-            b_val = bands[min(len(bands) - 1, int(t * (len(bands) - 1)))]
-            wave_dy = math.sin(t * math.pi * freq + self._wave_phase) * amp * (0.52 + b_val * 0.92) * env
+            env = math.sin(t * math.pi) ** 0.75
+            d = abs(t - 0.5) * 2.0
+            fi = d * (n_b - 1) * 0.78
+            i0 = int(fi)
+            i1 = min(n_b - 1, i0 + 1)
+            fr = fi - i0
+            b_val = (bands[i0] * (1.0 - fr) + bands[i1] * fr) * active_gate
+            shimmer = math.sin(t * math.pi * 8.0 + self._wave_phase) * (b_val * 2.4 + peak * 1.3) * active_gate
+            wave_dy = (b_val * amp_max + shimmer) * env
 
             dist_cursor = abs(px - self.sp_mx.value)
             cursor_ripple = (
                 math.cos(dist_cursor * 0.08 - self._wave_phase * 1.4)
-                * 2.2
+                * 1.6
                 * math.exp(-(dist_cursor * dist_cursor) / 3600.0)
                 * env
                 * exp
@@ -1979,6 +2013,15 @@ class DynamicIslandWidget(QWidget):
         wave_grad.setColorAt(0.50, QColor(min(255, r1 + 35), min(255, g1 + 25), min(255, b1 + 35), 255))
         wave_grad.setColorAt(0.86, QColor(142, 162, 255, 220))
         wave_grad.setColorAt(1.0, QColor(142, 162, 255, 0))
+        # Soft beat-synced glow under the liquid edge (only visible when music is actually loud)
+        glow_a = clamp(peak * 1.3)
+        if glow_a > 0.04:
+            p.save()
+            p.setOpacity(glow_a * 0.45)
+            p.setPen(QPen(QBrush(wave_grad), 5.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(bottom_wave_path)
+            p.restore()
         p.setPen(QPen(QBrush(wave_grad), 1.95, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(bottom_wave_path)
@@ -2040,16 +2083,32 @@ class DynamicIslandWidget(QWidget):
             return
 
         if track.is_playing or track.title:
-            art_r = QRectF(cap.left() + 12.0, cy - 12.0, 24.0, 24.0)
+            playing = track.is_playing
+            # Cover art: gently "breathes" with the kick drum, dims when paused
+            kick = clamp(peak_from_bands(bands)) if playing else 0.0
+            art_s = 24.0 + kick * 2.2
+            art_c = QPointF(cap.left() + 24.0, cy)
+            art_r = QRectF(art_c.x() - art_s * 0.5, art_c.y() - art_s * 0.5, art_s, art_s)
+            if playing and kick > 0.05:
+                halo = QRadialGradient(art_c, art_s * 0.95)
+                halo.setColorAt(0.0, QColor(accent_col.red(), accent_col.green(), accent_col.blue(), int(110 * kick)))
+                halo.setColorAt(1.0, QColor(accent_col.red(), accent_col.green(), accent_col.blue(), 0))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(halo))
+                p.drawEllipse(art_c, art_s * 0.95, art_s * 0.95)
             p.save()
             clip = QPainterPath()
-            clip.addRoundedRect(art_r, 6.5, 6.5)
+            clip.addRoundedRect(art_r, 7.0, 7.0)
             p.setClipPath(clip)
             if self._cover_hi_pix:
                 p.drawPixmap(art_r.toRect(), self._cover_hi_pix)
             else:
                 p.fillPath(clip, accent_col)
+            if not playing:
+                p.fillPath(clip, QColor(0, 0, 0, 120))
             p.restore()
+            if not playing:
+                VectorIcons.draw_pause(p, art_c, 9.0, QColor(255, 255, 255, 235))
 
             p.setPen(QColor(255, 255, 255, 248))
             p.setFont(QFont("Segoe UI Variable Display", 10, QFont.Weight.Bold))
@@ -2065,14 +2124,24 @@ class DynamicIslandWidget(QWidget):
                 f"{w_data.temp}°",
             )
 
+            # Real 5-band spectrum (bass -> treble), mirrored around the centre line
+            groups = ((0, 3), (3, 8), (8, 14), (14, 21), (21, 30))
+            bar_w = 3.0
+            gap = 2.6
+            n_bars = len(groups)
             eq_right = cap.right() - 16.0
-            for i in range(4):
-                val = bands[i * 4 + 2] if track.is_playing else 0.15
-                bh = max(4.5, min(16.0, 4.5 + val * 13.0))
-                bx = eq_right - (3 - i) * 5.5 - 3.0
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(accent_col)
-                p.drawRoundedRect(QRectF(bx, cy - bh * 0.5, 2.8, bh), 1.4, 1.4)
+            eq_left = eq_right - n_bars * bar_w - (n_bars - 1) * gap
+            eq_grad = QLinearGradient(QPointF(eq_left, 0), QPointF(eq_right, 0))
+            eq_grad.setColorAt(0.0, accent_col)
+            eq_grad.setColorAt(1.0, QColor(142, 162, 255, 255))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(eq_grad))
+            for gi, (a, b) in enumerate(groups):
+                seg = bands[a:b] or [0.0]
+                val = max(seg) * 0.65 + (sum(seg) / len(seg)) * 0.35 if playing else 0.0
+                bh = 3.0 + clamp(val) * 15.0
+                bx = eq_left + gi * (bar_w + gap)
+                p.drawRoundedRect(QRectF(bx, cy - bh * 0.5, bar_w, bh), bar_w * 0.5, bar_w * 0.5)
             return
 
         if self.timer_running:
@@ -2451,9 +2520,19 @@ class DynamicIslandWidget(QWidget):
         else:
             # A) Top-Left Clickable Player Source Pill ('♪ Яндекс Музыка' / '♪ Плеер') -> Brings player window to front!
             player_sess = self._find_player_audio_session()
-            src_name = player_sess.name if player_sess else (track.source_app or "Плеер")
-            if len(src_name) > 14:
-                src_name = src_name[:14]
+            raw_src = (track.source_app or (player_sess.name if player_sess else "") or "Плеер").lower()
+            if "yandex" in raw_src or "яндекс" in raw_src:
+                src_name = "Яндекс Музыка"
+            elif "spotify" in raw_src:
+                src_name = "Spotify"
+            elif "chrome" in raw_src:
+                src_name = "Chrome"
+            elif "edge" in raw_src:
+                src_name = "Edge"
+            elif "telegram" in raw_src:
+                src_name = "Telegram"
+            else:
+                src_name = (player_sess.name if player_sess else (track.source_app or "Плеер"))[:14]
             src_pill = QRectF(p_card.left() + 12.0, p_card.top() + 12.0, 112.0, 24.0)
             self._hitboxes["btn_focus_player"] = src_pill
             h_fp, _ = self._get_btn_springs("btn_focus_player")
@@ -2484,27 +2563,28 @@ class DynamicIslandWidget(QWidget):
             art_c = art_r.center()
 
             if self.visualizer_mode == 0:
-                # Mode 0: 28-bar Radial Spectrum Halo + Left/Right Flanking Wing Bars
+                # Mode 0: Real 24-Band FFT Spectrum Flanking Wings (Bass near cover -> Treble outward)
                 for i in range(12):
-                    bv = bands[i * 2] if track.is_playing else (0.12 + 0.06 * math.sin(self._wave_phase + i * 0.6))
-                    bh = 5.0 + bv * 32.0
-                    # Left wing bars
+                    bv_l = bands[min(len(bands) - 1, i * 2)] if track.is_playing else 0.0
+                    bv_r = bands[min(len(bands) - 1, i * 2 + 1)] if track.is_playing else 0.0
+                    bh_l = 4.0 + bv_l * 38.0
+                    bh_r = 4.0 + bv_r * 38.0
                     lx = art_r.left() - 14.0 - i * 8.0
-                    p.setPen(Qt.PenStyle.NoPen)
-                    p.setBrush(QColor(r1, g1, b1, int(115 + bv * 135)))
-                    p.drawRoundedRect(QRectF(lx, art_c.y() - bh * 0.5, 3.6, bh), 1.8, 1.8)
-                    # Right wing bars
                     rx = art_r.right() + 10.4 + i * 8.0
-                    p.drawRoundedRect(QRectF(rx, art_c.y() - bh * 0.5, 3.6, bh), 1.8, 1.8)
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(QColor(r1, g1, b1, int(95 + bv_l * 160)))
+                    p.drawRoundedRect(QRectF(lx, art_c.y() - bh_l * 0.5, 3.6, bh_l), 1.8, 1.8)
+                    p.setBrush(QColor(r1, g1, b1, int(95 + bv_r * 160)))
+                    p.drawRoundedRect(QRectF(rx, art_c.y() - bh_r * 0.5, 3.6, bh_r), 1.8, 1.8)
             elif self.visualizer_mode == 1:
-                # Mode 1: Dual Bezier Silk Wave dancing across the card behind the cover
-                for l_i, (ph_m, al) in enumerate(((1.0, 115), (-1.3, 75))):
+                # Mode 1: Real FFT Audio Wave behind the cover (flat when silent/paused)
+                for l_i, (ph_m, al) in enumerate(((1.0, 130), (-1.3, 85))):
                     wpath = QPainterPath()
-                    wpath.moveTo(p_card.left(), art_c.y() + 26.0)
+                    wpath.moveTo(p_card.left(), art_c.y())
                     for step_i in range(17):
                         sx = p_card.left() + (step_i / 16.0) * p_card.width()
-                        bv = bands[step_i % len(bands)]
-                        sy = art_c.y() + math.sin(self._wave_phase * ph_m + step_i * 0.65) * (10.0 + bv * 26.0)
+                        bv = bands[step_i % len(bands)] if track.is_playing else 0.0
+                        sy = art_c.y() + math.sin(self._wave_phase * ph_m + step_i * 0.65) * (bv * 34.0)
                         wpath.lineTo(QPointF(sx, sy))
                     p.setPen(QPen(QColor(r1, g1, b1, al) if l_i == 0 else QColor(142, 162, 255, al), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
                     p.setBrush(Qt.BrushStyle.NoBrush)
@@ -3797,192 +3877,213 @@ class DynamicIslandWidget(QWidget):
             )
             return
 
-        # 1. Left Status & Action Column (236 x 342 px)
+        # Centered Luxury Update Studio Card (No text wall of release notes, pure sculpted UI & hero Update button!)
         has_upd = self.updater.update_available
-        l_card = self._draw_obsidian_card(
+        u_card = self._draw_obsidian_card(
             p,
-            QRectF(left_x, top, 236.0, 342.0),
-            18.0,
+            QRectF(left_x, top, w, 342.0),
+            20.0,
             cascade_order=0,
-            active_border=QColor(accent_col.red(), accent_col.green(), accent_col.blue(), 110) if has_upd else None,
+            active_border=QColor(accent_col.red(), accent_col.green(), accent_col.blue(), 115) if has_upd else None,
         )
 
-        # Glowing central emblem inside Left Card
-        orb_pt = QPointF(l_card.center().x(), l_card.top() + 58.0)
-        glow_r = QRadialGradient(orb_pt, 46.0)
-        if has_upd:
-            glow_r.setColorAt(0.0, QColor(accent_col.red(), accent_col.green(), accent_col.blue(), 115))
-            glow_r.setColorAt(1.0, QColor(accent_col.red(), accent_col.green(), accent_col.blue(), 0))
-        else:
-            glow_r.setColorAt(0.0, QColor(74, 222, 128, 85))
-            glow_r.setColorAt(1.0, QColor(74, 222, 128, 0))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(glow_r))
-        p.drawEllipse(orb_pt, 46.0, 46.0)
+        u_clip = QPainterPath()
+        u_clip.addRoundedRect(u_card, 20.0, 20.0)
+        p.save()
+        p.setClipPath(u_clip)
 
-        p.setPen(QPen(accent_col if has_upd else QColor(74, 222, 128, 165), 1.4))
-        p.setBrush(QColor(22, 22, 28, 255))
-        p.drawEllipse(orb_pt, 24.0, 24.0)
+        # Ambient dual-aurora backdrop glow inside Update Studio
+        breathe = 0.5 + 0.5 * math.sin(self._aurora_phase * 2.0)
+        cx_u = u_card.center().x()
+        orb_pt = QPointF(cx_u, u_card.top() + 74.0)
+
+        bg_glow = QRadialGradient(orb_pt, 210.0)
+        if has_upd:
+            bg_glow.setColorAt(0.0, QColor(accent_col.red(), accent_col.green(), accent_col.blue(), int(75 + 25 * breathe)))
+            bg_glow.setColorAt(0.55, QColor(142, 162, 255, 24))
+            bg_glow.setColorAt(1.0, QColor(15, 15, 20, 0))
+        else:
+            bg_glow.setColorAt(0.0, QColor(74, 222, 128, int(55 + 20 * breathe)))
+            bg_glow.setColorAt(0.55, QColor(142, 162, 255, 18))
+            bg_glow.setColorAt(1.0, QColor(15, 15, 20, 0))
+        p.fillRect(u_card, QBrush(bg_glow))
+
+        # Orbital Concentric Vector Rings around central emblem
+        for ri, r_rad in enumerate((46.0, 36.0)):
+            p.setPen(
+                QPen(
+                    QColor(accent_col.red(), accent_col.green(), accent_col.blue(), 55 - ri * 18)
+                    if has_upd
+                    else QColor(74, 222, 128, 48 - ri * 16),
+                    1.2,
+                )
+            )
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            ang_start = int(((self._aurora_phase * (55 if ri == 0 else -40)) % 360) * 16)
+            p.drawArc(QRectF(orb_pt.x() - r_rad, orb_pt.y() - r_rad, r_rad * 2, r_rad * 2), ang_start, 210 * 16)
+
+        p.setPen(QPen(accent_col if has_upd else QColor(74, 222, 128, 195), 1.6))
+        p.setBrush(QColor(20, 20, 26, 255))
+        p.drawEllipse(orb_pt, 27.0, 27.0)
         VectorIcons.draw_refresh(
             p,
             orb_pt,
-            20.0,
-            accent_col if has_upd else QColor(74, 222, 128, 245),
+            22.0,
+            accent_col if has_upd else QColor(74, 222, 128, 250),
         )
 
+        # App Title & Version Transition Pill
         p.setPen(QColor(255, 255, 255, 252))
-        p.setFont(QFont("Segoe UI Variable Display", 13, QFont.Weight.Bold))
+        p.setFont(QFont("Segoe UI Variable Display", 16, QFont.Weight.Bold))
         p.drawText(
-            QRectF(l_card.left() + 14, l_card.top() + 94, l_card.width() - 28, 24),
+            QRectF(u_card.left(), u_card.top() + 114.0, w, 28.0),
             Qt.AlignmentFlag.AlignCenter,
-            f"Island v{self.updater.local_version}",
+            f"Island  v{self.updater.local_version}",
         )
 
-        status_pill = QRectF(l_card.left() + 22, l_card.top() + 124, l_card.width() - 44, 26)
-        p.setPen(
-            QPen(
-                accent_col if has_upd else QColor(74, 222, 128, 110),
-                1.0,
-            )
-        )
-        p.setBrush(QColor(42, 20, 30, 195) if has_upd else QColor(18, 38, 28, 185))
-        p.drawRoundedRect(status_pill, 13.0, 13.0)
-        p.setPen(QColor(255, 220, 235) if has_upd else QColor(167, 243, 208))
+        status_pill = QRectF(cx_u - 118.0, u_card.top() + 148.0, 236.0, 28.0)
+        p.setPen(QPen(accent_col if has_upd else QColor(74, 222, 128, 120), 1.1))
+        p.setBrush(QColor(42, 20, 32, 210) if has_upd else QColor(18, 38, 28, 195))
+        p.drawRoundedRect(status_pill, 14.0, 14.0)
+        p.setPen(QColor(255, 228, 238) if has_upd else QColor(167, 243, 208))
         p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         p.drawText(
             status_pill,
             Qt.AlignmentFlag.AlignCenter,
-            f"Доступна версия v{self.updater.remote_version}" if has_upd else "Актуальная версия",
+            f"Доступна новая сборка  v{self.updater.remote_version}" if has_upd else "Установлена актуальная версия",
         )
 
-        p.setPen(QColor(155, 155, 168, 230))
-        p.setFont(QFont("Segoe UI", 8))
-        desc_status = (
-            "При нажатии «Обновить» Остров плавно свернётся в шкалу загрузки и перезапустится."
-            if has_upd
-            else "Установлены все последние улучшения интерфейса, плеера и погоды."
-        )
-        p.drawText(
-            QRectF(l_card.left() + 16, l_card.top() + 158, l_card.width() - 32, 48),
-            Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
-            desc_status,
-        )
-
-        # Conditional 'Обновить' Button: ONLY shown when an update is actually available!
-        act_btn = QRectF(l_card.left() + 18, l_card.top() + 214, l_card.width() - 36, 38)
+        # Centerpiece Hero 'Обновить' Button (264 x 54 px)
+        act_btn = QRectF(cx_u - 132.0, u_card.top() + 196.0, 264.0, 54.0)
         if has_upd:
             self._hitboxes["btn_github_update"] = act_btn
-            hu, _ = self._get_btn_springs("btn_github_update")
-            p.setPen(Qt.PenStyle.NoPen)
-            btn_grad = QLinearGradient(act_btn.topLeft(), act_btn.topRight())
+            hu, pu = self._get_btn_springs("btn_github_update")
+            sc_b = 1.0 + hu.value * 0.04 - pu.value * 0.06
+            p.save()
+            p.translate(act_btn.center())
+            p.scale(sc_b, sc_b)
+            p.translate(-act_btn.center())
+
+            # Multi-layer breathing neon aura halo
+            glow_rect = act_btn.adjusted(-10, -10, 10, 10)
+            for gi in range(4):
+                gr = glow_rect.adjusted(gi * 2.2, gi * 2.2, -gi * 2.2, -gi * 2.2)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(
+                    QColor(
+                        accent_col.red(),
+                        accent_col.green(),
+                        accent_col.blue(),
+                        int((20 + 22 * breathe + 38 * hu.value) / (gi + 1)),
+                    )
+                )
+                p.drawRoundedRect(gr, 24.0 - gi * 2.0, 24.0 - gi * 2.0)
+
+            btn_path = QPainterPath()
+            btn_path.addRoundedRect(act_btn, 17.0, 17.0)
+            btn_grad = QLinearGradient(act_btn.topLeft(), act_btn.bottomRight())
             btn_grad.setColorAt(0.0, accent_col)
-            btn_grad.setColorAt(1.0, QColor(244, 114, 182, 255))
-            p.setBrush(QBrush(btn_grad))
-            p.drawRoundedRect(act_btn, 12.0, 12.0)
+            btn_grad.setColorAt(0.52, QColor(244, 114, 182, 255))
+            btn_grad.setColorAt(1.0, QColor(142, 162, 255, 255))
+            p.fillPath(btn_path, QBrush(btn_grad))
+
+            # Top glass reflection + animated diagonal light sheen
+            p.save()
+            p.setClipPath(btn_path)
+            gloss = QLinearGradient(act_btn.topLeft(), act_btn.bottomLeft())
+            gloss.setColorAt(0.0, QColor(255, 255, 255, 82))
+            gloss.setColorAt(0.48, QColor(255, 255, 255, 0))
+            p.fillRect(act_btn, QBrush(gloss))
+
+            sweep_t = (self._aurora_phase * 0.38) % 1.8 - 0.4
+            sx = act_btn.left() + sweep_t * act_btn.width()
+            sweep = QLinearGradient(QPointF(sx - 52, 0), QPointF(sx + 52, 0))
+            sweep.setColorAt(0.0, QColor(255, 255, 255, 0))
+            sweep.setColorAt(0.5, QColor(255, 255, 255, 88))
+            sweep.setColorAt(1.0, QColor(255, 255, 255, 0))
+            p.fillRect(act_btn, QBrush(sweep))
+            p.restore()
+
+            p.setPen(QPen(QColor(255, 255, 255, 85), 1.15))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(act_btn.adjusted(0.5, 0.5, -0.5, -0.5), 17.0, 17.0)
+
+            # Icon + 'Обновить' + version badge pill inside button
+            ic_c = QPointF(act_btn.left() + 34.0, act_btn.center().y())
+            p.save()
+            p.translate(ic_c)
+            p.rotate(hu.value * 210.0)
+            p.translate(-ic_c)
+            VectorIcons.draw_refresh(p, ic_c, 17.0, QColor(255, 255, 255, 255))
+            p.restore()
+
             p.setPen(QColor(255, 255, 255, 255))
-            p.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-            p.drawText(act_btn, Qt.AlignmentFlag.AlignCenter, f"Обновить до v{self.updater.remote_version}")
+            p.setFont(QFont("Segoe UI Variable Display", 11, QFont.Weight.Bold))
+            p.drawText(
+                QRectF(act_btn.left() + 52.0, act_btn.top(), 125.0, act_btn.height()),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                "Обновить",
+            )
+
+            v_chip = QRectF(act_btn.right() - 74.0, act_btn.center().y() - 12.0, 58.0, 24.0)
+            p.setPen(QPen(QColor(255, 255, 255, 65), 1.0))
+            p.setBrush(QColor(0, 0, 0, 75))
+            p.drawRoundedRect(v_chip, 12.0, 12.0)
+            p.setPen(QColor(255, 255, 255, 250))
+            p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+            p.drawText(v_chip, Qt.AlignmentFlag.AlignCenter, f"v{self.updater.remote_version}")
+            p.restore()
         else:
             self._hitboxes["btn_github_check"] = act_btn
             hc, _ = self._get_btn_springs("btn_github_check")
-            p.setPen(QPen(QColor(255, 255, 255, int(lerp(24, 58, hc.value))), 1.0))
-            p.setBrush(QColor(26, 26, 34, 255))
-            p.drawRoundedRect(act_btn, 12.0, 12.0)
-            p.setPen(QColor(225, 225, 235, 245))
-            p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-            p.drawText(act_btn, Qt.AlignmentFlag.AlignCenter, "Проверить обновления")
+            checking = self.updater.status == "checking"
+            p.setPen(QPen(QColor(255, 255, 255, int(lerp(24, 68, hc.value))), 1.1))
+            p.setBrush(QColor(int(lerp(24, 34, hc.value)), int(lerp(24, 34, hc.value)), int(lerp(32, 44, hc.value)), 255))
+            p.drawRoundedRect(act_btn, 17.0, 17.0)
+            chk_font = QFont("Segoe UI", 10, QFont.Weight.Bold)
+            label = "Проверка обновлений..." if checking else "Проверить обновления"
+            tw_lbl = QFontMetrics(chk_font).horizontalAdvance(label)
+            total_w = 18.0 + 10.0 + tw_lbl
+            ic_c = QPointF(act_btn.center().x() - total_w * 0.5 + 9.0, act_btn.center().y())
+            p.save()
+            p.translate(ic_c)
+            p.rotate((self._wave_phase * 60.0) % 360.0 if checking else hc.value * 180.0)
+            p.translate(-ic_c)
+            VectorIcons.draw_refresh(p, ic_c, 15.0, QColor(230, 230, 240, 245))
+            p.restore()
+            p.setPen(QColor(235, 235, 245, 245))
+            p.setFont(chk_font)
+            p.drawText(
+                QRectF(ic_c.x() + 18.0, act_btn.top(), tw_lbl + 6.0, act_btn.height()),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                label,
+            )
 
-        # Bottom Legal Buttons ('Политика' and 'Согласие')
-        bw_leg = (l_card.width() - 44.0) * 0.5
-        btn_priv = QRectF(l_card.left() + 18.0, l_card.bottom() - 44.0, bw_leg, 30.0)
-        btn_cons = QRectF(btn_priv.right() + 8.0, l_card.bottom() - 44.0, bw_leg, 30.0)
+        # Symmetrical Bottom Legal Pills ('Политика конфиденциальности' & 'Пользовательское соглашение')
+        btn_priv = QRectF(cx_u - 216.0, u_card.bottom() - 48.0, 208.0, 32.0)
+        btn_cons = QRectF(cx_u + 8.0, u_card.bottom() - 48.0, 208.0, 32.0)
         self._hitboxes["btn_open_privacy"] = btn_priv
         self._hitboxes["btn_open_consent"] = btn_cons
 
         for b_key, b_rect, b_lbl in (
-            ("btn_open_privacy", btn_priv, "Политика"),
-            ("btn_open_consent", btn_cons, "Согласие"),
+            ("btn_open_privacy", btn_priv, "Политика конфиденциальности"),
+            ("btn_open_consent", btn_cons, "Пользовательское соглашение"),
         ):
             hb, _ = self._get_btn_springs(b_key)
-            p.setPen(QPen(QColor(255, 255, 255, int(lerp(20, 55, hb.value))), 1.0))
-            p.setBrush(QColor(24, 24, 30, 255))
-            p.drawRoundedRect(b_rect, 9.5, 9.5)
+            p.setPen(QPen(QColor(255, 255, 255, int(lerp(20, 58, hb.value))), 1.0))
+            p.setBrush(QColor(22, 22, 28, 235))
+            p.drawRoundedRect(b_rect, 11.0, 11.0)
             if b_key == "btn_open_consent":
-                dot_c = QPointF(b_rect.left() + 12.0, b_rect.center().y())
+                dot_c = QPointF(b_rect.left() + 14.0, b_rect.center().y())
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QColor(74, 222, 128) if self.consent_mgr.accepted else QColor(148, 163, 184))
-                p.drawEllipse(dot_c, 2.8, 2.8)
+                p.drawEllipse(dot_c, 3.0, 3.0)
                 p.setPen(QColor(225, 225, 235, 240))
                 p.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
-                p.drawText(b_rect.adjusted(9, 0, 0, 0), Qt.AlignmentFlag.AlignCenter, b_lbl)
+                p.drawText(b_rect.adjusted(12, 0, 0, 0), Qt.AlignmentFlag.AlignCenter, b_lbl)
             else:
                 p.setPen(QColor(225, 225, 235, 240))
                 p.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
                 p.drawText(b_rect, Qt.AlignmentFlag.AlignCenter, b_lbl)
 
-        # 2. Right Changelog Menu ('Обновления, которые будут при перезапуске')
-        rx = l_card.right() + 12.0
-        rw = cap.right() - 22.0 - rx
-        r_card = self._draw_obsidian_card(p, QRectF(rx, top, rw, 342.0), 18.0, cascade_order=1)
-
-        p.setPen(QColor(255, 255, 255, 252))
-        p.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        hdr_txt = (
-            "Обновления, которые будут при перезапуске"
-            if has_upd
-            else "Список обновлений и изменений сборки"
-        )
-        p.drawText(
-            QRectF(r_card.left() + 18, r_card.top() + 14, rw - 96, 22),
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            hdr_txt,
-        )
-
-        ver_badge = QRectF(r_card.right() - 78, r_card.top() + 13, 62, 22)
-        p.setPen(QPen(QColor(142, 162, 255, 90), 1.0))
-        p.setBrush(QColor(26, 28, 42, 255))
-        p.drawRoundedRect(ver_badge, 11.0, 11.0)
-        p.setPen(periwinkle)
-        p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-        p.drawText(ver_badge, Qt.AlignmentFlag.AlignCenter, f"v{self.updater.remote_version}")
-
-        iy = r_card.top() + 46.0
-        tag_colors = {
-            "Погода": (QColor(56, 189, 248, 240), QColor(18, 38, 54, 230)),
-            "Анимация": (QColor(244, 114, 182, 245), QColor(46, 20, 36, 230)),
-            "Интерфейс": (QColor(142, 162, 255, 245), QColor(24, 28, 48, 230)),
-            "Плеер": (QColor(74, 222, 128, 245), QColor(18, 40, 28, 230)),
-        }
-
-        for idx, item in enumerate(self.updater.changelog[:4]):
-            item_r = QRectF(r_card.left() + 14.0, iy, rw - 28.0, 66.0)
-            p.setPen(QPen(QColor(255, 255, 255, 18), 1.0))
-            p.setBrush(QColor(20, 20, 26, 245))
-            p.drawRoundedRect(item_r, 13.0, 13.0)
-
-            tag_lbl = item.get("tag", "Модуль")
-            fg_t, bg_t = tag_colors.get(tag_lbl, (periwinkle, QColor(26, 28, 42, 230)))
-            tag_r = QRectF(item_r.left() + 12.0, item_r.top() + 10.0, 72.0, 18.0)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(bg_t)
-            p.drawRoundedRect(tag_r, 9.0, 9.0)
-            p.setPen(fg_t)
-            p.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
-            p.drawText(tag_r, Qt.AlignmentFlag.AlignCenter, tag_lbl)
-
-            p.setPen(QColor(255, 255, 255, 250))
-            p.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-            p.drawText(
-                QRectF(tag_r.right() + 10.0, item_r.top() + 9.0, item_r.width() - 92.0, 20.0),
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                item.get("title", ""),
-            )
-
-            p.setPen(QColor(165, 165, 178, 235))
-            p.setFont(QFont("Segoe UI", 8))
-            p.drawText(
-                QRectF(item_r.left() + 12.0, item_r.top() + 31.0, item_r.width() - 24.0, 30.0),
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
-                item.get("desc", ""),
-            )
-            iy += 72.0
+        p.restore()
