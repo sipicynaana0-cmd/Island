@@ -41,6 +41,7 @@ from backend import (
     ClipboardEntry,
     ConsentManager,
     GitHubUpdater,
+    LyricsEngine,
     MediaSessionWorker,
     SystemTelemetry,
     TrackInfo,
@@ -1059,6 +1060,11 @@ class DynamicIslandWidget(QWidget):
         self.likes_mgr = TrackLikesManager()
         self.consent_mgr = ConsentManager()
         self.updater = GitHubUpdater()
+        self.lyrics_engine = LyricsEngine()
+        self.show_lyrics_view: bool = False
+        self._last_lyric_idx: int = -2
+        self._cached_lyric_line: str = ""
+        self.sp_lyric_slide = SpringValue(0.0, stiffness=380.0, damping=34.0)
         self.legal_doc_mode: str = ""  # "", "privacy", "consent"
         self.dimmer_overlay = ScreenDimmerOverlay()
         self.snip_overlay = RegionSnipOverlay(self._on_region_captured)
@@ -1124,9 +1130,17 @@ class DynamicIslandWidget(QWidget):
         self.is_updating_collapse = False
         self.sp_update_prog = SpringValue(0.0, stiffness=180.0, damping=26.0)
 
-        self.character_mode = 2
+        self.character_mode = 1  # Default: Living Expressive Eyes (1: Глазки, 2: Котик, 0: Погода)
         self._blink_timer = 0.0
         self._is_blinking = False
+        self._eye_emotion: str = "neutral"  # neutral, happy, sleepy, surprised, vibe, curious
+        self._eye_happy_until: float = 0.0
+        self._eye_surprised_until: float = 0.0
+        self._pet_last_x: float = 0.0
+        self._pet_dir: int = 0
+        self._pet_flips: int = 0
+        self._pet_last_ts: float = 0.0
+        self._last_clip_seq: int = RUST_CORE.clipboard_seq()
 
         # Player & Volume Bar Functional Modes (Screenshot 2 upgrades!)
         self.visualizer_mode = 0  # 0: Круговой спектр + Аврора, 1: Живая Волна, 2: Винил
@@ -1196,8 +1210,8 @@ class DynamicIslandWidget(QWidget):
         self._power_confirm_until = 0.0
         self.show_inline_mixer = False
 
-        # App Launcher Dock items on Home tab
-        self.launcher_items: List[Tuple[str, str, str]] = [
+        # App Launcher Dock items on Home tab (defaults + persisted custom user apps)
+        default_launchers: List[Tuple[str, str, str]] = [
             ("Проводник", "explorer.exe", "folder"),
             ("Блокнот", "notepad.exe", "notepad"),
             ("PowerShell", "powershell.exe", "ps"),
@@ -1206,6 +1220,12 @@ class DynamicIslandWidget(QWidget):
             ("Калькулятор", "calc.exe", "calc"),
             ("Параметры", "ms-settings:", "settings"),
         ]
+        if self.consent_mgr.custom_launchers:
+            self.launcher_items: List[Tuple[str, str, str]] = [
+                (it[0], it[1], it[2]) for it in self.consent_mgr.custom_launchers
+            ]
+        else:
+            self.launcher_items = default_launchers
 
         # Interaction states
         self.is_hovered = False
@@ -1245,10 +1265,12 @@ class DynamicIslandWidget(QWidget):
         self._dragging_bright_slider = False
         self._dragging_app_slider: Optional[str] = None
 
-        # 120 FPS animation loop
+        # Auto-adaptive native monitor refresh rate loop via Rust Core (60..240 Hz!)
+        self._display_hz: int = RUST_CORE.get_refresh_rate_hz()
+        frame_ms = max(4, min(16, int(round(1000.0 / max(60, self._display_hz)))))
         self._last_frame_time = time.monotonic()
         self._anim_timer = QTimer(self)
-        self._anim_timer.setInterval(8)
+        self._anim_timer.setInterval(frame_ms)
         self._anim_timer.timeout.connect(self._on_anim_frame)
 
         # Fast 30ms watcher
@@ -1368,6 +1390,8 @@ class DynamicIslandWidget(QWidget):
         self._osd_started_at = now
         self._osd_duration = max(0.3, duration)
         self._osd_until = now + duration
+        if osd_type == "notif":
+            self._eye_surprised_until = now + 1.8
         self._update_target_dimensions()
         self._ensure_anim_running()
 
@@ -1470,7 +1494,8 @@ class DynamicIslandWidget(QWidget):
                 self.sp_r.set_target(20.0)
             self.sp_expand.set_target(0.0)
         elif has_media:
-            self.sp_w.set_target(318.0, stiffness=420.0, damping=41.0)
+            pill_w = 396.0 if (track.is_playing and self.consent_mgr.lyrics_enabled and bool(self._cached_lyric_line)) else 318.0
+            self.sp_w.set_target(pill_w, stiffness=420.0, damping=41.0)
             self.sp_h.set_target(36.0, stiffness=420.0, damping=41.0)
             self.sp_r.set_target(18.0)
             self.sp_expand.set_target(0.0)
@@ -1488,6 +1513,26 @@ class DynamicIslandWidget(QWidget):
     def _on_fast_watch(self):
         now = time.monotonic()
 
+        # Native Rust Global Hotkeys (Ctrl+Shift+I: Summon with 2-Eyes | Alt+M: Quick Mute)
+        hk = RUST_CORE.poll_hotkeys()
+        if hk & 1:
+            if self.game_hide_state == "hidden_arrow":
+                self._game_summoned_override = True
+                self._start_eyes_reveal()
+            else:
+                self._hide_to_game_arrow()
+        if hk & 2:
+            self.audio.toggle_master_mute()
+            vol, muted = self.audio.get_master_volume()
+            self._last_master_vol, self._last_master_mute = vol, muted
+            self._trigger_osd("vol", "Mute" if muted else f"{int(vol)}%", vol, duration=1.35)
+
+        # Zero-cost 1ns Rust Win32 clipboard sequence check
+        c_seq = RUST_CORE.clipboard_seq()
+        if c_seq != self._last_clip_seq:
+            self._last_clip_seq = c_seq
+            self._on_clipboard_changed()
+
         # Automatic Fullscreen Game Hide / Return (Rust Win32 Detector!)
         in_game = self.telemetry.is_game_fullscreen
         if in_game and not self._last_game_fs:
@@ -1502,6 +1547,25 @@ class DynamicIslandWidget(QWidget):
 
         local_pos = QPointF(self.mapFromGlobal(QCursor.pos()))
         cap = self.current_capsule_rect()
+
+        # Petting gesture detection over top capsule ('поглаживание' -> счастливые глазки ^ ^!)
+        if cap.adjusted(-16, -6, 16, 22).contains(local_pos):
+            dx_pet = local_pos.x() - self._pet_last_x
+            if abs(dx_pet) > 9.0:
+                new_dir = 1 if dx_pet > 0 else -1
+                if self._pet_dir != 0 and new_dir != self._pet_dir and (now - self._pet_last_ts) < 0.75:
+                    self._pet_flips += 1
+                    if self._pet_flips >= 3:
+                        self._eye_happy_until = now + 2.4
+                        self._pet_flips = 0
+                elif (now - self._pet_last_ts) > 0.9:
+                    self._pet_flips = 0
+                self._pet_dir = new_dir
+                self._pet_last_x = local_pos.x()
+                self._pet_last_ts = now
+        else:
+            if (now - self._pet_last_ts) > 1.0:
+                self._pet_flips = 0
 
         if self.game_hide_state == "hidden_arrow":
             arrow_hit = cap.adjusted(-10.0, -4.0, 10.0, 8.0)
@@ -1614,24 +1678,39 @@ class DynamicIslandWidget(QWidget):
         dt = now - self._last_frame_time
         self._last_frame_time = now
 
-        track, _ = self.media.get_snapshot()
+        track, pos_s = self.media.get_snapshot()
+
+        # Update Live Synced Lyrics index (O(log N) via Rust Core!)
+        if track.title and self.consent_mgr.lyrics_enabled:
+            _, curr_l, _, l_st, l_idx = self.lyrics_engine.get_live_state(
+                track.artist, track.title, pos_s, track.duration
+            )
+            self._cached_lyric_line = curr_l if (l_st in ("synced", "plain") and curr_l and curr_l != "· · ·") else ""
+            if l_idx != self._last_lyric_idx:
+                self._last_lyric_idx = l_idx
+                self.sp_lyric_slide.value = 1.0
+                self.sp_lyric_slide.set_target(0.0)
+        else:
+            self._cached_lyric_line = ""
+
         self._update_target_dimensions()
 
         local_pos = QPointF(self.mapFromGlobal(QCursor.pos()))
         self.sp_mx.set_target(local_pos.x())
         self.sp_my.set_target(local_pos.y())
-        self.sp_mx.step(dt)
-        self.sp_my.step(dt)
 
         cap = self.current_capsule_rect()
         eye_origin = QPointF(cap.left() + 26.0, cap.height() * 0.48)
-        edx = local_pos.x() - eye_origin.x()
-        edy = local_pos.y() - eye_origin.y()
-        edist = max(1.0, math.hypot(edx, edy))
-        self.sp_eye_dx.set_target((edx / edist) * min(2.6, edist * 0.015))
-        self.sp_eye_dy.set_target((edy / edist) * min(1.9, edist * 0.015))
-        self.sp_eye_dx.step(dt)
-        self.sp_eye_dy.step(dt)
+        if self.is_drag_hover:
+            # Look eagerly down-center toward the dragged file
+            self.sp_eye_dx.set_target(1.8)
+            self.sp_eye_dy.set_target(2.1)
+        else:
+            edx = local_pos.x() - eye_origin.x()
+            edy = local_pos.y() - eye_origin.y()
+            edist = max(1.0, math.hypot(edx, edy))
+            self.sp_eye_dx.set_target((edx / edist) * min(2.6, edist * 0.015))
+            self.sp_eye_dy.set_target((edy / edist) * min(1.9, edist * 0.015))
 
         # Ensure monochrome covers stay vibrant neon coral-rose
         tr, tg, tb = track.accent_color
@@ -1640,24 +1719,7 @@ class DynamicIslandWidget(QWidget):
         self.sp_r1.set_target(float(tr))
         self.sp_g1.set_target(float(tg))
         self.sp_b1.set_target(float(tb))
-        self.sp_r1.step(dt)
-        self.sp_g1.step(dt)
-        self.sp_b1.step(dt)
-
-        self.sp_w.step(dt)
-        self.sp_h.step(dt)
-        self.sp_r.step(dt)
-        self.sp_expand.step(dt)
-        self.sp_osd.step(dt)
-        self.sp_cascade.step(dt)
-        self.sp_top_y.step(dt)
-        self.sp_ferro_pull.step(dt)
-        self.sp_ferro_x.step(dt)
-        self.sp_tab_trans.step(dt)
         self.sp_update_prog.set_target(self.updater.progress)
-        self.sp_update_prog.step(dt)
-        for sp_t in self.tab_open_sp:
-            sp_t.step(dt)
 
         new_hover = ""
         if self.sp_expand.value > 0.35:
@@ -1667,12 +1729,43 @@ class DynamicIslandWidget(QWidget):
                     break
         self._hovered_key = new_hover
 
+        all_springs = [
+            self.sp_mx, self.sp_my,
+            self.sp_eye_dx, self.sp_eye_dy,
+            self.sp_r1, self.sp_g1, self.sp_b1,
+            self.sp_w, self.sp_h, self.sp_r,
+            self.sp_expand, self.sp_osd, self.sp_cascade,
+            self.sp_top_y, self.sp_ferro_pull, self.sp_ferro_x,
+            self.sp_tab_trans, self.sp_update_prog, self.sp_lyric_slide,
+        ]
+        all_springs.extend(self.tab_open_sp)
         for k in list(self.btn_hover_sp.keys()):
             h_sp, p_sp = self.btn_hover_sp[k], self.btn_press_sp[k]
             h_sp.set_target(1.0 if k == self._hovered_key else 0.0)
             p_sp.set_target(0.0)
-            h_sp.step(dt)
-            p_sp.step(dt)
+            all_springs.append(h_sp)
+            all_springs.append(p_sp)
+
+        # Single batched native Rust spring physics call (< 20 us for ALL springs at 60..240 Hz!)
+        if not RUST_CORE.step_springs_batch(all_springs, dt):
+            for sp in all_springs:
+                sp.step(dt)
+
+        # Compute Living Eye Emotion State Machine
+        pk_now = self.audio._smooth_peak
+        hour_now = time.localtime().tm_hour
+        if now < self._eye_happy_until:
+            self._eye_emotion = "happy"
+        elif now < self._eye_surprised_until:
+            self._eye_emotion = "surprised"
+        elif self.is_drag_hover:
+            self._eye_emotion = "curious"
+        elif track.is_playing and pk_now > 0.58:
+            self._eye_emotion = "vibe"
+        elif hour_now >= 23 or hour_now < 6:
+            self._eye_emotion = "sleepy"
+        else:
+            self._eye_emotion = "neutral"
 
         alive_ripples: List[ClickRipple] = []
         for rp in self._ripples:
@@ -1681,14 +1774,14 @@ class DynamicIslandWidget(QWidget):
                 alive_ripples.append(rp)
         self._ripples = alive_ripples
 
+        blink_interval = 5.4 if self._eye_emotion == "sleepy" else 3.6
         self._blink_timer += dt
-        if self._blink_timer > 3.6:
+        if self._blink_timer > blink_interval:
             self._is_blinking = True
-            if self._blink_timer > 3.74:
+            if self._blink_timer > blink_interval + (0.24 if self._eye_emotion == "sleepy" else 0.14):
                 self._is_blinking = False
                 self._blink_timer = random.uniform(-0.8, 0.4)
 
-        pk_now = self.audio._smooth_peak
         self._wave_phase = (self._wave_phase + dt * (1.2 + pk_now * 18.0 if track.is_playing else 0.0)) % (math.pi * 40.0)
         self._aurora_phase = (self._aurora_phase + dt * (0.8 + pk_now * 2.4 if track.is_playing else 0.45)) % (math.pi * 20.0)
         if track.is_playing:
@@ -1766,6 +1859,22 @@ class DynamicIslandWidget(QWidget):
     def mousePressEvent(self, event):
         pos = event.position()
         if event.button() == Qt.MouseButton.RightButton:
+            # Right-clicking an app icon in the Smart Dock removes it safely
+            if self.sp_expand.value >= 0.45 and self.active_tab == 0:
+                for k, rect in list(self._hitboxes.items()):
+                    if k.startswith("launch_") and k != "launch_add" and rect.contains(pos):
+                        try:
+                            idx = int(k.split("_")[1])
+                            if 0 <= idx < len(self.launcher_items) and len(self.launcher_items) > 1:
+                                removed_name = self.launcher_items[idx][0]
+                                self.launcher_items.pop(idx)
+                                self.consent_mgr.custom_launchers = [list(it) for it in self.launcher_items]
+                                self.consent_mgr.save_all()
+                                self._trigger_osd("drop", f"Убрано: {removed_name}", duration=1.35)
+                                self.update()
+                                return
+                        except Exception:
+                            pass
             self.is_pinned_open = not self.is_pinned_open
             self._update_target_dimensions()
             self._ensure_anim_running()
@@ -1829,6 +1938,10 @@ class DynamicIslandWidget(QWidget):
             self._app_sessions = self.audio.get_app_sessions()
         elif key == "btn_vis_mode":
             self.visualizer_mode = (self.visualizer_mode + 1) % 3
+        elif key == "btn_lyrics_toggle":
+            self.show_lyrics_view = not self.show_lyrics_view
+            self.consent_mgr.lyrics_enabled = True
+            self.consent_mgr.save_all()
         elif key == "btn_focus_player":
             track, _ = self.media.get_snapshot()
             focus_media_player_window(track.source_app)
@@ -1903,6 +2016,13 @@ class DynamicIslandWidget(QWidget):
             self.legal_doc_mode = ""
         elif key == "btn_toggle_consent":
             self.consent_mgr.set_accepted(not self.consent_mgr.accepted)
+        elif key == "btn_style_lyrics":
+            self.consent_mgr.lyrics_enabled = not self.consent_mgr.lyrics_enabled
+            self.consent_mgr.save_all()
+            if not self.consent_mgr.lyrics_enabled:
+                self.show_lyrics_view = False
+                self._cached_lyric_line = ""
+            self._update_target_dimensions()
         elif key == "btn_style_float":
             self.consent_mgr.island_float_mode = (self.consent_mgr.island_float_mode + 1) % 2
             self.consent_mgr.save_all()
@@ -1951,15 +2071,16 @@ class DynamicIslandWidget(QWidget):
             self._trigger_osd("drop", f"Буст ПК: +{freed} МБ ОЗУ свободно", duration=1.6)
         elif key == "qa_cmd":
             self._switch_to_tab(6)
-        elif key.startswith("launch_"):
-            idx = int(key.split("_")[1])
-            if 0 <= idx < len(self.launcher_items):
-                launch_shell_target(self.launcher_items[idx][1])
         elif key == "launch_add":
-            fpath, _ = QFileDialog.getOpenFileName(self, "Добавить программу или файл на Главную")
-            if fpath:
-                name = os.path.splitext(os.path.basename(fpath))[0][:12]
-                self.launcher_items.append((name, fpath, "custom"))
+            # Defer file dialog outside mousePressEvent & use parent=None so translucent Tool window NEVER crashes!
+            QTimer.singleShot(30, self._open_add_launcher_dialog)
+        elif key.startswith("launch_"):
+            try:
+                idx = int(key.split("_")[1])
+                if 0 <= idx < len(self.launcher_items):
+                    launch_shell_target(self.launcher_items[idx][1])
+            except (ValueError, IndexError):
+                pass
         elif key == "clip_clear":
             self.clipboard_history = [e for e in self.clipboard_history if e.pinned]
         elif key.startswith("clip_item_"):
@@ -2047,6 +2168,37 @@ class DynamicIslandWidget(QWidget):
             app_name = key[len("app_slider_"):]
             self._dragging_app_slider = app_name
             self._set_app_vol_from_mouse(app_name, pos.x(), rect)
+
+    def _open_add_launcher_dialog(self):
+        """Safely opens native Windows file picker outside mousePressEvent so translucent Frameless Tool window never crashes."""
+        was_pinned = self.is_pinned_open
+        self.is_pinned_open = True
+        try:
+            fpath, _ = QFileDialog.getOpenFileName(
+                None,
+                "Добавить программу или файл на Главную",
+                "",
+                "Программы и файлы (*.exe *.lnk *.bat *.cmd *.url *.*)",
+            )
+            if fpath and os.path.exists(fpath):
+                name = os.path.splitext(os.path.basename(fpath))[0].strip()[:12] or "App"
+                # Keep max 8 visible dock items (if already at 8, replace the oldest built-in or append cleanly)
+                if len(self.launcher_items) >= 8:
+                    self.launcher_items.insert(0, (name, fpath, "custom"))
+                    self.launcher_items = self.launcher_items[:8]
+                else:
+                    self.launcher_items.append((name, fpath, "custom"))
+                self.consent_mgr.custom_launchers = [list(it) for it in self.launcher_items]
+                self.consent_mgr.save_all()
+                self._trigger_osd("drop", f"Добавлено: {name}", duration=1.5)
+        except Exception:
+            self._trigger_osd("drop", "Не удалось добавить файл", duration=1.4)
+        finally:
+            self.is_pinned_open = was_pinned
+            self._force_topmost()
+            self._update_target_dimensions()
+            self._ensure_anim_running()
+            self.update()
 
     def _take_fullscreen_screenshot(self):
         try:
@@ -2638,31 +2790,46 @@ class DynamicIslandWidget(QWidget):
             if not playing:
                 VectorIcons.draw_pause(p, art_c, 8.5, QColor(255, 255, 255, 240))
 
-            # Clean centered time | cloud temp cluster
-            p.setPen(QColor(255, 255, 255, 248))
-            p.setFont(QFont("Segoe UI Variable Display", 9, QFont.Weight.Bold))
-            p.drawText(
-                QRectF(cap.center().x() - 56.0, cap.top(), 46.0, cap.height()),
-                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
-                time.strftime("%H:%M"),
-            )
-            p.setPen(QPen(QColor(255, 255, 255, 42), 1.0))
-            p.drawLine(QPointF(cap.center().x() - 3.0, cy - 5.5), QPointF(cap.center().x() - 3.0, cy + 5.5))
-            VectorIcons.draw_weather_cloud(p, QPointF(cap.center().x() + 11.0, cy), 12.5, QColor(235, 242, 255, 235), filled=True)
-            p.setPen(QColor(235, 240, 252, 240))
-            p.drawText(
-                QRectF(cap.center().x() + 22.0, cap.top(), 38.0, cap.height()),
-                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                f"{w_data.temp}°",
-            )
-
-            # Sleek 5-bar micro-equalizer (refined 2.4px bars, capped at 13px max height)
+            # Live Synced Lyric Ticker in center (when playing & lyrics active) OR clean time | cloud temp cluster
             eq_right = self._paint_privacy_dots(p, cap.right() - 14.0, cy)
             groups = ((0, 3), (3, 8), (8, 14), (14, 21), (21, 30))
             bar_w = 2.4
             gap = 2.2
             n_bars = len(groups)
             eq_left = eq_right - n_bars * bar_w - (n_bars - 1) * gap
+
+            live_lyr = self._cached_lyric_line if (playing and self.consent_mgr.lyrics_enabled) else ""
+            if live_lyr:
+                slide_y = self.sp_lyric_slide.value * 8.0
+                lyr_rect = QRectF(art_r.right() + 10.0, cap.top() + slide_y, max(40.0, eq_left - art_r.right() - 20.0), cap.height())
+                p.save()
+                p.setClipRect(QRectF(art_r.right() + 8.0, cap.top() + 2.0, max(40.0, eq_left - art_r.right() - 16.0), cap.height() - 4.0), Qt.ClipOperation.IntersectClip)
+                p.setOpacity(clamp(1.0 - self.sp_lyric_slide.value * 0.55))
+                l_font = QFont("Segoe UI", 8, QFont.Weight.DemiBold)
+                p.setFont(l_font)
+                el_lyr = QFontMetrics(l_font).elidedText(live_lyr, Qt.TextElideMode.ElideRight, int(lyr_rect.width()))
+                p.setPen(QColor(250, 250, 255, 248))
+                p.drawText(lyr_rect, Qt.AlignmentFlag.AlignCenter, el_lyr)
+                p.restore()
+            else:
+                p.setPen(QColor(255, 255, 255, 248))
+                p.setFont(QFont("Segoe UI Variable Display", 9, QFont.Weight.Bold))
+                p.drawText(
+                    QRectF(cap.center().x() - 56.0, cap.top(), 46.0, cap.height()),
+                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                    time.strftime("%H:%M"),
+                )
+                p.setPen(QPen(QColor(255, 255, 255, 42), 1.0))
+                p.drawLine(QPointF(cap.center().x() - 3.0, cy - 5.5), QPointF(cap.center().x() - 3.0, cy + 5.5))
+                VectorIcons.draw_weather_cloud(p, QPointF(cap.center().x() + 11.0, cy), 12.5, QColor(235, 242, 255, 235), filled=True)
+                p.setPen(QColor(235, 240, 252, 240))
+                p.drawText(
+                    QRectF(cap.center().x() + 22.0, cap.top(), 38.0, cap.height()),
+                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                    f"{w_data.temp}°",
+                )
+
+            # Sleek 5-bar micro-equalizer (refined 2.4px bars, capped at 13px max height)
             eq_grad = QLinearGradient(QPointF(eq_left, 0), QPointF(eq_right, 0))
             eq_grad.setColorAt(0.0, accent_col)
             eq_grad.setColorAt(1.0, QColor(142, 162, 255, 255))
@@ -2743,24 +2910,63 @@ class DynamicIslandWidget(QWidget):
         )
 
     def _draw_character_eyes(self, p: QPainter, center: QPointF):
+        """Living Expressive Eyes Engine (reacts to petting, bass kicks, late night, notifications & drag-hover)."""
         p.save()
         look_x = self.sp_eye_dx.value
         look_y = self.sp_eye_dy.value
+        emo = self._eye_emotion
+        pk = self.audio._smooth_peak
 
-        for ox in (-5.2, 5.2):
+        # Happy squinting '^ ^' when stroked/petted with cursor!
+        if emo == "happy":
+            p.setPen(QPen(QColor(255, 255, 255, 250), 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            for ox in (-5.6, 5.6):
+                ex = center.x() + ox
+                ey = center.y() + 0.5
+                arc = QPainterPath()
+                arc.moveTo(ex - 3.6, ey + 1.4)
+                arc.quadTo(ex, ey - 3.6, ex + 3.6, ey + 1.4)
+                p.drawPath(arc)
+            # Soft warm rosy blush under happy eyes
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(244, 114, 182, 130))
+            p.drawEllipse(QPointF(center.x() - 9.2, center.y() + 3.2), 2.2, 1.3)
+            p.drawEllipse(QPointF(center.x() + 9.2, center.y() + 3.2), 2.2, 1.3)
+            p.restore()
+            return
+
+        vibe_bounce = -math.sin(self._wave_phase * 2.2) * pk * 1.6 if emo == "vibe" else 0.0
+        for ox in (-5.5, 5.5):
             ex = center.x() + ox
-            ey = center.y()
+            ey = center.y() + vibe_bounce
             if self._is_blinking:
-                p.setPen(QPen(QColor(255, 255, 255, 235), 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-                p.drawLine(QPointF(ex - 3.5, ey), QPointF(ex + 3.5, ey))
-            else:
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QColor(255, 255, 255, 245))
-                p.drawEllipse(QPointF(ex, ey), 4.2, 5.0)
-                p.setBrush(QColor(10, 10, 14, 255))
-                p.drawEllipse(QPointF(ex + look_x, ey + look_y), 2.1, 2.4)
-                p.setBrush(QColor(255, 255, 255, 240))
-                p.drawEllipse(QPointF(ex + look_x - 0.7, ey + look_y - 0.8), 0.7, 0.7)
+                p.setPen(QPen(QColor(255, 255, 255, 235), 1.65, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.drawLine(QPointF(ex - 3.6, ey), QPointF(ex + 3.6, ey))
+                continue
+
+            rx = 4.6 if emo in ("surprised", "curious") else 4.3
+            ry = 5.9 if emo == "surprised" else (5.5 if emo == "curious" else (4.2 if emo == "vibe" else 5.1))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(255, 255, 255, 248))
+            p.drawEllipse(QPointF(ex, ey), rx, ry)
+
+            # Pupil + expressive catchlight sparkle
+            pr_x = 1.8 if emo == "surprised" else 2.2
+            pr_y = 2.0 if emo == "surprised" else (2.1 if emo == "vibe" else 2.5)
+            p.setBrush(QColor(10, 10, 14, 255))
+            p.drawEllipse(QPointF(ex + look_x, ey + look_y), pr_x, pr_y)
+            p.setBrush(QColor(255, 255, 255, 245))
+            p.drawEllipse(QPointF(ex + look_x - 0.8, ey + look_y - 0.9), 0.85 if emo == "surprised" else 0.72, 0.85 if emo == "surprised" else 0.72)
+            if emo in ("surprised", "curious"):
+                p.drawEllipse(QPointF(ex + look_x + 0.9, ey + look_y + 0.8), 0.45, 0.45)
+
+            # Sleepy late-night half-closed upper eyelid (23:00..05:59)
+            if emo == "sleepy":
+                p.setBrush(QColor(0, 0, 0, 255))
+                p.drawRect(QRectF(ex - rx - 1.0, ey - ry - 1.0, rx * 2.0 + 2.0, ry * 0.95))
+                p.setPen(QPen(QColor(215, 220, 235, 195), 1.1, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.drawLine(QPointF(ex - rx + 0.3, ey - ry * 0.05), QPointF(ex + rx - 0.3, ey - ry * 0.05))
         p.restore()
 
     def _draw_character_cat(self, p: QPainter, center: QPointF):
@@ -3130,9 +3336,23 @@ class DynamicIslandWidget(QWidget):
             p.setFont(QFont("Segoe UI", 7, QFont.Weight.DemiBold))
             p.drawText(src_pill.adjusted(24, 0, -6, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, src_name)
 
-            # B) Top-Right Visualizer Style Switcher Pill ('Кольцо' / 'Волна' / 'Винил')
-            vis_names = {0: "Спектр: Кольцо", 1: "Спектр: Волна", 2: "Спектр: Винил"}
-            vis_pill = QRectF(p_card.right() - 108.0, p_card.top() + 12.0, 96.0, 24.0)
+            # B) Top-Right Live Lyrics Pill ('Текст') + Compact Visualizer Pill ('Кольцо' / 'Волна' / 'Винил') — 27px clear of Album Art!
+            lyr_pill = QRectF(p_card.right() - 136.0, p_card.top() + 12.0, 52.0, 24.0)
+            self._hitboxes["btn_lyrics_toggle"] = lyr_pill
+            h_lt, _ = self._get_btn_springs("btn_lyrics_toggle")
+            if self.show_lyrics_view:
+                p.setPen(QPen(accent_col, 1.0))
+                p.setBrush(QColor(accent_col.red(), accent_col.green(), accent_col.blue(), 52))
+            else:
+                p.setPen(QPen(QColor(255, 255, 255, int(lerp(18, 55, h_lt.value))), 1.0))
+                p.setBrush(QColor(22, 22, 28, 215))
+            p.drawRoundedRect(lyr_pill, 12.0, 12.0)
+            p.setPen(QColor(255, 255, 255, 250) if self.show_lyrics_view else QColor(215, 215, 225, 235))
+            p.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold if self.show_lyrics_view else QFont.Weight.DemiBold))
+            p.drawText(lyr_pill, Qt.AlignmentFlag.AlignCenter, "Текст")
+
+            vis_names = {0: "Кольцо", 1: "Волна", 2: "Винил"}
+            vis_pill = QRectF(p_card.right() - 78.0, p_card.top() + 12.0, 66.0, 24.0)
             self._hitboxes["btn_vis_mode"] = vis_pill
             h_vm, _ = self._get_btn_springs("btn_vis_mode")
             p.setPen(QPen(QColor(255, 255, 255, int(lerp(18, 55, h_vm.value))), 1.0))
@@ -3142,108 +3362,191 @@ class DynamicIslandWidget(QWidget):
             p.setFont(QFont("Segoe UI", 7, QFont.Weight.DemiBold))
             p.drawText(vis_pill, Qt.AlignmentFlag.AlignCenter, vis_names.get(self.visualizer_mode, "Кольцо"))
 
-            # C) Living Audio Visualizer around/behind the Album Cover!
-            float_y = math.sin(self._aurora_phase * 1.3) * 2.0
-            bass_sc = 1.0 + (peak * 0.05 if track.is_playing else 0.0)
-            art_r = QRectF(p_card.center().x() - 44.0, p_card.top() + 14.0 + float_y, 88.0, 88.0)
-            art_c = art_r.center()
-
-            if self.visualizer_mode == 0:
-                # Mode 0: Real 24-Band FFT Spectrum Flanking Wings (Bass near cover -> Treble outward)
-                for i in range(12):
-                    bv_l = bands[min(len(bands) - 1, i * 2)] if track.is_playing else 0.0
-                    bv_r = bands[min(len(bands) - 1, i * 2 + 1)] if track.is_playing else 0.0
-                    bh_l = 4.0 + bv_l * 38.0
-                    bh_r = 4.0 + bv_r * 38.0
-                    lx = art_r.left() - 14.0 - i * 8.0
-                    rx = art_r.right() + 10.4 + i * 8.0
-                    p.setPen(Qt.PenStyle.NoPen)
-                    p.setBrush(QColor(r1, g1, b1, int(95 + bv_l * 160)))
-                    p.drawRoundedRect(QRectF(lx, art_c.y() - bh_l * 0.5, 3.6, bh_l), 1.8, 1.8)
-                    p.setBrush(QColor(r1, g1, b1, int(95 + bv_r * 160)))
-                    p.drawRoundedRect(QRectF(rx, art_c.y() - bh_r * 0.5, 3.6, bh_r), 1.8, 1.8)
-            elif self.visualizer_mode == 1:
-                # Mode 1: Real FFT Audio Wave behind the cover (flat when silent/paused)
-                for l_i, (ph_m, al) in enumerate(((1.0, 130), (-1.3, 85))):
-                    wpath = QPainterPath()
-                    wpath.moveTo(p_card.left(), art_c.y())
-                    for step_i in range(17):
-                        sx = p_card.left() + (step_i / 16.0) * p_card.width()
-                        bv = bands[step_i % len(bands)] if track.is_playing else 0.0
-                        sy = art_c.y() + math.sin(self._wave_phase * ph_m + step_i * 0.65) * (bv * 34.0)
-                        wpath.lineTo(QPointF(sx, sy))
-                    p.setPen(QPen(QColor(r1, g1, b1, al) if l_i == 0 else QColor(142, 162, 255, al), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-                    p.setBrush(Qt.BrushStyle.NoBrush)
-                    p.drawPath(wpath)
-            else:
-                # Mode 2: Peeking Spinning Vinyl Disc behind the right side of the Album Cover
+            if self.show_lyrics_view:
+                # Apple-Music-style Real-Time Synced Lyrics Stage inside Player Card!
+                prev_l, curr_l, next_l, l_status, _ = self.lyrics_engine.get_live_state(
+                    track.artist, track.title, pos_sec, track.duration
+                )
+                # Compact track mini-header beneath top pills
+                mini_r = QRectF(p_card.left() + 16.0, p_card.top() + 44.0, 26.0, 26.0)
+                mclip = QPainterPath()
+                mclip.addRoundedRect(mini_r, 6.0, 6.0)
                 p.save()
-                p.translate(art_c.x() + 34.0, art_c.y())
-                p.rotate(self._vinyl_angle)
-                p.setPen(QPen(QColor(255, 255, 255, 45), 1.2))
-                p.setBrush(QColor(12, 12, 16, 255))
-                p.drawEllipse(QPointF(0, 0), 42.0, 42.0)
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                for gf in (0.82, 0.66, 0.50):
-                    p.setPen(QPen(QColor(255, 255, 255, 22), 0.9))
-                    p.drawEllipse(QPointF(0, 0), 42.0 * gf, 42.0 * gf)
+                p.setClipPath(mclip, Qt.ClipOperation.IntersectClip)
+                if self._cover_hi_pix:
+                    p.drawPixmap(mini_r.toRect(), self._cover_hi_pix)
+                else:
+                    p.fillPath(mclip, accent_col)
+                p.restore()
+                t_sm = QFont("Segoe UI", 8, QFont.Weight.Bold)
+                p.setFont(t_sm)
+                p.setPen(QColor(245, 245, 252, 240))
+                hdr_txt = f"{track.title or 'Трек'}  ·  {track.artist or ''}".strip(" ·")
+                p.drawText(
+                    QRectF(mini_r.right() + 9.0, mini_r.top() + 1.0, p_card.width() - 125.0, 24.0),
+                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                    QFontMetrics(t_sm).elidedText(hdr_txt, Qt.TextElideMode.ElideRight, int(p_card.width() - 130)),
+                )
+                badge_st = "Синхр." if l_status == "synced" else ("Текст" if l_status == "plain" else ("Поиск..." if l_status == "loading" else "Нет"))
+                p.setPen(QColor(accent_col.red(), accent_col.green(), accent_col.blue(), 220))
+                p.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+                p.drawText(
+                    QRectF(p_card.right() - 72.0, mini_r.top() + 1.0, 56.0, 24.0),
+                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                    badge_st,
+                )
+
+                # 3-Line Scrolling Synced Lyrics Viewport with Spring Slide-Up Transition
+                slide_dy = self.sp_lyric_slide.value * 14.0
+                stage_r = QRectF(p_card.left() + 16.0, p_card.top() + 74.0, p_card.width() - 32.0, 78.0)
+                p.save()
+                p.setClipRect(stage_r, Qt.ClipOperation.IntersectClip)
+                if l_status in ("synced", "plain"):
+                    f_dim = QFont("Segoe UI", 9, QFont.Weight.Medium)
+                    f_act = QFont("Segoe UI Variable Display", 12, QFont.Weight.Bold)
+                    fm_dim = QFontMetrics(f_dim)
+                    fm_act = QFontMetrics(f_act)
+                    max_lw = int(stage_r.width() - 12.0)
+
+                    if prev_l:
+                        p.setPen(QColor(180, 184, 200, 105))
+                        p.setFont(f_dim)
+                        p.drawText(
+                            QRectF(stage_r.left(), stage_r.top() + 2.0 + slide_dy, stage_r.width(), 20.0),
+                            Qt.AlignmentFlag.AlignCenter,
+                            fm_dim.elidedText(prev_l, Qt.TextElideMode.ElideRight, max_lw),
+                        )
+
+                    # Soft luminous glow pill behind active singing line
+                    act_y = stage_r.top() + 25.0 + slide_dy
+                    p.setPen(QColor(255, 255, 255, 255))
+                    p.setFont(f_act)
+                    p.drawText(
+                        QRectF(stage_r.left(), act_y, stage_r.width(), 26.0),
+                        Qt.AlignmentFlag.AlignCenter,
+                        fm_act.elidedText(curr_l or "· · ·", Qt.TextElideMode.ElideRight, max_lw),
+                    )
+
+                    if next_l:
+                        p.setPen(QColor(185, 190, 208, 125))
+                        p.setFont(f_dim)
+                        p.drawText(
+                            QRectF(stage_r.left(), stage_r.top() + 54.0 + slide_dy, stage_r.width(), 20.0),
+                            Qt.AlignmentFlag.AlignCenter,
+                            fm_dim.elidedText(next_l, Qt.TextElideMode.ElideRight, max_lw),
+                        )
+                elif l_status == "loading":
+                    p.setPen(QColor(195, 200, 218, 210))
+                    p.setFont(QFont("Segoe UI", 10, QFont.Weight.Medium))
+                    p.drawText(stage_r, Qt.AlignmentFlag.AlignCenter, "Ищу синхронизированный текст песни...")
+                else:
+                    p.setPen(QColor(155, 160, 178, 195))
+                    p.setFont(QFont("Segoe UI", 9, QFont.Weight.Medium))
+                    p.drawText(stage_r, Qt.AlignmentFlag.AlignCenter, "Для этого трека текст пока не найден")
+                p.restore()
+            else:
+                # C) Living Audio Visualizer around/behind the Album Cover!
+                float_y = math.sin(self._aurora_phase * 1.3) * 2.0
+                bass_sc = 1.0 + (peak * 0.05 if track.is_playing else 0.0)
+                art_r = QRectF(p_card.center().x() - 44.0, p_card.top() + 14.0 + float_y, 88.0, 88.0)
+                art_c = art_r.center()
+
+                if self.visualizer_mode == 0:
+                    # Mode 0: Real 24-Band FFT Spectrum Flanking Wings (Bass near cover -> Treble outward)
+                    for i in range(12):
+                        bv_l = bands[min(len(bands) - 1, i * 2)] if track.is_playing else 0.0
+                        bv_r = bands[min(len(bands) - 1, i * 2 + 1)] if track.is_playing else 0.0
+                        bh_l = 4.0 + bv_l * 38.0
+                        bh_r = 4.0 + bv_r * 38.0
+                        lx = art_r.left() - 14.0 - i * 8.0
+                        rx = art_r.right() + 10.4 + i * 8.0
+                        p.setPen(Qt.PenStyle.NoPen)
+                        p.setBrush(QColor(r1, g1, b1, int(95 + bv_l * 160)))
+                        p.drawRoundedRect(QRectF(lx, art_c.y() - bh_l * 0.5, 3.6, bh_l), 1.8, 1.8)
+                        p.setBrush(QColor(r1, g1, b1, int(95 + bv_r * 160)))
+                        p.drawRoundedRect(QRectF(rx, art_c.y() - bh_r * 0.5, 3.6, bh_r), 1.8, 1.8)
+                elif self.visualizer_mode == 1:
+                    # Mode 1: Real FFT Audio Wave behind the cover (flat when silent/paused)
+                    for l_i, (ph_m, al) in enumerate(((1.0, 130), (-1.3, 85))):
+                        wpath = QPainterPath()
+                        wpath.moveTo(p_card.left(), art_c.y())
+                        for step_i in range(17):
+                            sx = p_card.left() + (step_i / 16.0) * p_card.width()
+                            bv = bands[step_i % len(bands)] if track.is_playing else 0.0
+                            sy = art_c.y() + math.sin(self._wave_phase * ph_m + step_i * 0.65) * (bv * 34.0)
+                            wpath.lineTo(QPointF(sx, sy))
+                        p.setPen(QPen(QColor(r1, g1, b1, al) if l_i == 0 else QColor(142, 162, 255, al), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                        p.setBrush(Qt.BrushStyle.NoBrush)
+                        p.drawPath(wpath)
+                else:
+                    # Mode 2: Peeking Spinning Vinyl Disc behind the right side of the Album Cover
+                    p.save()
+                    p.translate(art_c.x() + 34.0, art_c.y())
+                    p.rotate(self._vinyl_angle)
+                    p.setPen(QPen(QColor(255, 255, 255, 45), 1.2))
+                    p.setBrush(QColor(12, 12, 16, 255))
+                    p.drawEllipse(QPointF(0, 0), 42.0, 42.0)
+                    p.setBrush(Qt.BrushStyle.NoBrush)
+                    for gf in (0.82, 0.66, 0.50):
+                        p.setPen(QPen(QColor(255, 255, 255, 22), 0.9))
+                        p.drawEllipse(QPointF(0, 0), 42.0 * gf, 42.0 * gf)
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(accent_col)
+                    p.drawEllipse(QPointF(0, 0), 13.0, 13.0)
+                    p.setBrush(QColor(0, 0, 0))
+                    p.drawEllipse(QPointF(0, 0), 4.0, 4.0)
+                    p.restore()
+
+                # Draw Rounded Album Cover
+                p.save()
+                p.translate(art_c)
+                p.scale(bass_sc, bass_sc)
+                p.translate(-art_c)
+
                 p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(accent_col)
-                p.drawEllipse(QPointF(0, 0), 13.0, 13.0)
-                p.setBrush(QColor(0, 0, 0))
-                p.drawEllipse(QPointF(0, 0), 4.0, 4.0)
+                p.setBrush(QColor(0, 0, 0, 130))
+                p.drawRoundedRect(art_r.translated(0, 6.0), 16.0, 16.0)
+
+                aclip = QPainterPath()
+                aclip.addRoundedRect(art_r, 16.0, 16.0)
+                p.save()
+                p.setClipPath(aclip, Qt.ClipOperation.IntersectClip)
+                if self._cover_hi_pix:
+                    p.drawPixmap(art_r.toRect(), self._cover_hi_pix)
+                else:
+                    grad_c = QLinearGradient(art_r.topLeft(), art_r.bottomRight())
+                    grad_c.setColorAt(0.0, QColor(r1, g1, b1, 255))
+                    grad_c.setColorAt(1.0, QColor(38, 30, 75, 255))
+                    p.fillPath(aclip, QBrush(grad_c))
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(QColor(255, 225, 165, 235))
+                    p.drawEllipse(QPointF(art_c.x(), art_c.y() + 2.0), 21.0, 21.0)
+                p.restore()
+                p.setPen(QPen(QColor(255, 255, 255, 42), 1.1))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRoundedRect(art_r, 16.0, 16.0)
                 p.restore()
 
-            # Draw Rounded Album Cover
-            p.save()
-            p.translate(art_c)
-            p.scale(bass_sc, bass_sc)
-            p.translate(-art_c)
+                # Centered Track Title & Artist
+                title_str = track.title or "Midnight Drive"
+                artist_str = track.artist or "Включи музыку в браузере или плеере"
+                p.setPen(QColor(255, 255, 255, 252))
+                t_font = QFont("Segoe UI Variable Display", 12, QFont.Weight.Bold)
+                p.setFont(t_font)
+                p.drawText(
+                    QRectF(p_card.left() + 20.0, p_card.top() + 112.0, p_card.width() - 40.0, 22.0),
+                    Qt.AlignmentFlag.AlignCenter,
+                    QFontMetrics(t_font).elidedText(title_str, Qt.TextElideMode.ElideRight, int(p_card.width() - 40)),
+                )
 
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(0, 0, 0, 130))
-            p.drawRoundedRect(art_r.translated(0, 6.0), 16.0, 16.0)
-
-            aclip = QPainterPath()
-            aclip.addRoundedRect(art_r, 16.0, 16.0)
-            p.save()
-            p.setClipPath(aclip, Qt.ClipOperation.IntersectClip)
-            if self._cover_hi_pix:
-                p.drawPixmap(art_r.toRect(), self._cover_hi_pix)
-            else:
-                grad_c = QLinearGradient(art_r.topLeft(), art_r.bottomRight())
-                grad_c.setColorAt(0.0, QColor(r1, g1, b1, 255))
-                grad_c.setColorAt(1.0, QColor(38, 30, 75, 255))
-                p.fillPath(aclip, QBrush(grad_c))
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QColor(255, 225, 165, 235))
-                p.drawEllipse(QPointF(art_c.x(), art_c.y() + 2.0), 21.0, 21.0)
-            p.restore()
-            p.setPen(QPen(QColor(255, 255, 255, 42), 1.1))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRoundedRect(art_r, 16.0, 16.0)
-            p.restore()
-
-            # Centered Track Title & Artist
-            title_str = track.title or "Midnight Drive"
-            artist_str = track.artist or "Включи музыку в браузере или плеере"
-            p.setPen(QColor(255, 255, 255, 252))
-            t_font = QFont("Segoe UI Variable Display", 12, QFont.Weight.Bold)
-            p.setFont(t_font)
-            p.drawText(
-                QRectF(p_card.left() + 20.0, p_card.top() + 112.0, p_card.width() - 40.0, 22.0),
-                Qt.AlignmentFlag.AlignCenter,
-                QFontMetrics(t_font).elidedText(title_str, Qt.TextElideMode.ElideRight, int(p_card.width() - 40)),
-            )
-
-            p.setPen(QColor(165, 165, 178, 235))
-            a_font = QFont("Segoe UI", 9, QFont.Weight.Medium)
-            p.setFont(a_font)
-            p.drawText(
-                QRectF(p_card.left() + 20.0, p_card.top() + 133.0, p_card.width() - 40.0, 18.0),
-                Qt.AlignmentFlag.AlignCenter,
-                QFontMetrics(a_font).elidedText(artist_str, Qt.TextElideMode.ElideRight, int(p_card.width() - 40)),
-            )
+                p.setPen(QColor(165, 165, 178, 235))
+                a_font = QFont("Segoe UI", 9, QFont.Weight.Medium)
+                p.setFont(a_font)
+                p.drawText(
+                    QRectF(p_card.left() + 20.0, p_card.top() + 133.0, p_card.width() - 40.0, 18.0),
+                    Qt.AlignmentFlag.AlignCenter,
+                    QFontMetrics(a_font).elidedText(artist_str, Qt.TextElideMode.ElideRight, int(p_card.width() - 40)),
+                )
 
             # Interactive Progress Timeline Bar (Uses instant scrub preview when dragging!)
             live_pos_sec = self._scrub_preview_sec if (self._dragging_prog_slider and self._scrub_preview_sec is not None) else pos_sec
@@ -3422,7 +3725,7 @@ class DynamicIslandWidget(QWidget):
         p.drawText(dev_pill.adjusted(25, 0, -18, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, fx_labels[self.audio_fx_mode])
         VectorIcons.draw_chevron_down(p, QPointF(dev_pill.right() - 11.0, v_cy), 9.5, QColor(165, 165, 175))
 
-        # 3. Photo 3 Redesign: Modern Color-Tinted 2x4 Bento Tool Matrix (Accurate Icons + Subtitles!)
+        # 3. Sleek Monochrome Obsidian 2x4 Quick Actions Matrix (Zero rainbow clutter — pure OLED minimalism!)
         qa_x = left_x + 420.0
         qa_w = 111.0
         qa_h = 65.0
@@ -3432,17 +3735,17 @@ class DynamicIslandWidget(QWidget):
         now = time.monotonic()
         pipette_sub = self.fn_picked_hex if now < self.fn_color_scanning_until else "HEX цвет"
         qa_specs = [
-            ("qa_area", "Область", "Скрин зоны", VectorIcons.draw_area_select, QColor(56, 189, 248)),
-            ("qa_full", "Экран", "Весь снимок", VectorIcons.draw_monitor, QColor(96, 165, 250)),
-            ("qa_ocr", "Текст", "С экрана", VectorIcons.draw_ocr_scan, QColor(129, 140, 248)),
-            ("qa_qr", "QR-код", "Из буфера", VectorIcons.draw_qr, QColor(192, 132, 252)),
-            ("qa_pipette", "Пипетка", pipette_sub, VectorIcons.draw_pipette, QColor(244, 114, 182)),
-            ("qa_clean", "Очистка", "Без пробелов", VectorIcons.draw_sparkle, QColor(45, 212, 191)),
-            ("qa_record", "Буст ОЗУ", f"ОЗУ {self.telemetry.ram_percent}%", VectorIcons.draw_lightning, QColor(52, 211, 153)),
-            ("qa_cmd", "Система", "Управление", VectorIcons.draw_sliders_h, QColor(251, 191, 36)),
+            ("qa_area", "Область", "Скрин зоны", VectorIcons.draw_area_select),
+            ("qa_full", "Экран", "Весь снимок", VectorIcons.draw_monitor),
+            ("qa_ocr", "Текст", "С экрана", VectorIcons.draw_ocr_scan),
+            ("qa_qr", "QR-код", "Из буфера", VectorIcons.draw_qr),
+            ("qa_pipette", "Пипетка", pipette_sub, VectorIcons.draw_pipette),
+            ("qa_clean", "Очистка", "Без пробелов", VectorIcons.draw_sparkle),
+            ("qa_record", "Буст ОЗУ", f"ОЗУ {self.telemetry.ram_percent}%", VectorIcons.draw_lightning),
+            ("qa_cmd", "Система", "Управление", VectorIcons.draw_sliders_h),
         ]
 
-        for idx, (qkey, qlabel, qsub, qicon, qcol) in enumerate(qa_specs):
+        for idx, (qkey, qlabel, qsub, qicon) in enumerate(qa_specs):
             col_i = idx % 2
             row_i = idx // 2
             qx = qa_x + col_i * (qa_w + qa_gap_x)
@@ -3450,7 +3753,7 @@ class DynamicIslandWidget(QWidget):
             h_sp, p_sp = self._get_btn_springs(qkey)
             hov, prs = h_sp.value, p_sp.value
 
-            q_border = QColor(qcol.red(), qcol.green(), qcol.blue(), int(lerp(24, 135, hov))) if hov > 0.05 else None
+            q_border = QColor(255, 255, 255, int(lerp(18, 62, hov))) if hov > 0.04 else None
             qrect = self._draw_obsidian_card(
                 p,
                 QRectF(qx, qy, qa_w, qa_h),
@@ -3467,22 +3770,22 @@ class DynamicIslandWidget(QWidget):
             p.scale(sc, sc)
             p.translate(-qrect.center())
 
-            # Tinted 28x28 squircle icon badge on the left
+            # Pure neutral dark-glass icon container + crisp monochrome white/silver vector glyph
             badge_r = QRectF(qrect.left() + 9.0, qrect.center().y() - 14.0, 28.0, 28.0)
-            p.setPen(QPen(QColor(qcol.red(), qcol.green(), qcol.blue(), int(lerp(45, 115, hov))), 1.0))
-            p.setBrush(QColor(qcol.red(), qcol.green(), qcol.blue(), int(lerp(26, 52, hov))))
+            p.setPen(QPen(QColor(255, 255, 255, int(lerp(20, 65, hov))), 1.0))
+            p.setBrush(QColor(int(lerp(24, 38, hov)), int(lerp(24, 38, hov)), int(lerp(31, 47, hov)), 255))
             p.drawRoundedRect(badge_r, 9.0, 9.0)
-            qicon(p, badge_r.center(), 14.0, qcol)
+            qicon(p, badge_r.center(), 14.0, QColor(255, 255, 255, int(lerp(212, 255, hov))))
 
-            # Single-line bold title + micro-subtitle
-            p.setPen(QColor(250, 250, 255, 252))
+            # Single-line bold title + clean muted subtitle
+            p.setPen(QColor(246, 246, 252, int(lerp(236, 255, hov))))
             p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
             p.drawText(
                 QRectF(badge_r.right() + 7.0, qrect.top() + 14.0, qrect.right() - badge_r.right() - 10.0, 17.0),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                 qlabel,
             )
-            p.setPen(QColor(150, 154, 168, int(lerp(215, 250, hov))))
+            p.setPen(QColor(142, 145, 158, int(lerp(205, 245, hov))))
             p.setFont(QFont("Segoe UI", 7, QFont.Weight.Medium))
             p.drawText(
                 QRectF(badge_r.right() + 7.0, qrect.top() + 33.0, qrect.right() - badge_r.right() - 10.0, 15.0),
@@ -3491,7 +3794,7 @@ class DynamicIslandWidget(QWidget):
             )
             p.restore()
 
-        # 4. Photo 4 Redesign: Sculpted Full-Width OLED Glass Smart Dock with Clear Labels!
+        # 4. Sculpted Full-Width OLED Glass Smart Dock with Clear Labels (Up to 8 apps + '+ Добавить'!)
         dock_r = self._draw_obsidian_card(p, QRectF(left_x, top + 292.0, 652.0, 64.0), 16.0, cascade_order=5)
         cursor_in_dock = dock_r.adjusted(-12, -16, 12, 16).contains(QPointF(self.sp_mx.value, self.sp_my.value))
 
@@ -3504,7 +3807,7 @@ class DynamicIslandWidget(QWidget):
             "calc": "Калькул.",
             "settings": "Настройки",
         }
-        items_vis = self.launcher_items[:7]
+        items_vis = self.launcher_items[:8]
         total_slots = len(items_vis) + 1
         slot_w = (dock_r.width() - 24.0) / float(total_slots)
 
@@ -3529,7 +3832,7 @@ class DynamicIslandWidget(QWidget):
             p.translate(lrect.center() + QPointF(0, lift_y))
             p.scale(sc, sc)
             p.translate(-lrect.center())
-            self._draw_launcher_app_icon(p, lrect, lkind)
+            self._draw_launcher_app_icon(p, lrect, lkind, lname)
             p.restore()
 
             lbl_txt = short_names.get(lkind, lname[:9])
@@ -3556,7 +3859,7 @@ class DynamicIslandWidget(QWidget):
         p.setFont(QFont("Segoe UI", 7, QFont.Weight.Medium))
         p.drawText(QRectF(add_cx - slot_w * 0.48, dock_r.bottom() - 19.0, slot_w * 0.96, 15.0), Qt.AlignmentFlag.AlignCenter, "Добавить")
 
-    def _draw_launcher_app_icon(self, p: QPainter, r: QRectF, kind: str):
+    def _draw_launcher_app_icon(self, p: QPainter, r: QRectF, kind: str, name: str = ""):
         """Sculpted OLED Glass Squircle App Icons with glossy inner highlights & crisp vector glyphs."""
         p.save()
         palettes = {
@@ -3567,8 +3870,9 @@ class DynamicIslandWidget(QWidget):
             "snip": (QColor(244, 114, 182), QColor(190, 24, 93)),
             "calc": (QColor(167, 139, 250), QColor(109, 40, 217)),
             "settings": (QColor(129, 140, 248), QColor(67, 56, 202)),
+            "custom": (QColor(56, 58, 72), QColor(28, 30, 38)),
         }
-        c1, c2 = palettes.get(kind, (QColor(100, 116, 139), QColor(51, 65, 85)))
+        c1, c2 = palettes.get(kind, (QColor(56, 58, 72), QColor(28, 30, 38)))
         grad = QLinearGradient(r.topLeft(), r.bottomRight())
         grad.setColorAt(0.0, c1)
         grad.setColorAt(1.0, c2)
@@ -3609,6 +3913,11 @@ class DynamicIslandWidget(QWidget):
             VectorIcons.draw_scissors(p, r.center(), 15.5, white)
         elif kind == "calc":
             VectorIcons.draw_calc(p, r.center(), 15.5, white)
+        elif kind == "custom":
+            letter = (name.strip()[:1] or "A").upper()
+            p.setPen(white)
+            p.setFont(QFont("Segoe UI Variable Display", 12, QFont.Weight.Bold))
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, letter)
         else:
             VectorIcons.draw_gear(p, r.center(), 15.5, white)
         p.restore()
@@ -4557,9 +4866,9 @@ class DynamicIslandWidget(QWidget):
             pr = 1.2 + (pi % 3) * 0.55
             p.drawEllipse(QPointF(px_d, py_d), pr, pr)
 
-        # Top-Left Hardware Engine Pill (Rust Core v2.0 Native DLL status) & Top-Right Channel Pill
+        # Top-Left Hardware Engine Pill (Rust Core v2.1 Native DLL status + Display Hz) & Top-Right Channel Pill
         rust_active = RUST_CORE.is_loaded
-        rc_pill = QRectF(u_card.left() + 16.0, u_card.top() + 14.0, 126.0, 22.0)
+        rc_pill = QRectF(u_card.left() + 16.0, u_card.top() + 14.0, 152.0, 22.0)
         p.setPen(QPen(QColor(251, 146, 60, 120) if rust_active else QColor(148, 163, 184, 70), 1.0))
         p.setBrush(QColor(42, 24, 14, 195) if rust_active else QColor(24, 25, 34, 190))
         p.drawRoundedRect(rc_pill, 11.0, 11.0)
@@ -4571,7 +4880,7 @@ class DynamicIslandWidget(QWidget):
         p.drawText(
             rc_pill.adjusted(18, 0, -4, 0),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-            "Rust Core v2.0" if rust_active else "Python Engine",
+            f"Rust Core v2.1 · {self._display_hz}Hz" if rust_active else f"Python Engine · {self._display_hz}Hz",
         )
 
         gh_pill = QRectF(u_card.right() - 122.0, u_card.top() + 14.0, 106.0, 22.0)
