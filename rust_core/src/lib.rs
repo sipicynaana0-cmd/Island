@@ -1,7 +1,7 @@
-//! Native Rust High-Performance Core v2.1 for Island (Dynamic Island for Windows)
+//! Native Rust High-Performance Core v2.2 for Island (Dynamic Island for Windows)
 //! Zero external crate dependencies — pure std + direct Win32 FFI.
 //! Exports:
-//!   - rust_core_version() -> u32 (210)
+//!   - rust_core_version() -> u32 (220)
 //!   - rust_fft_32bands(...) -> fast Radix-2 FFT + 32 logarithmic bands + AGC
 //!   - rust_is_fullscreen_game(own_hwnd) -> Win32 fullscreen game detector
 //!   - rust_get_system_stats(out_cpu, out_ram) -> Win32 GetSystemTimes + GlobalMemoryStatusEx
@@ -9,12 +9,20 @@
 //!   - rust_step_springs(...) -> batched sub-stepped spring physics solver (60..240 Hz)
 //!   - rust_get_refresh_rate_hz() -> native Win32 display Hz detector
 //!   - rust_clipboard_seq() -> 1ns Win32 GetClipboardSequenceNumber
-//!   - rust_poll_hotkeys() -> Win32 edge-triggered global hotkey detector
+//!   - rust_poll_hotkeys() -> Win32 edge-triggered hotkeys (Ctrl+Shift+I, Alt+M, Alt+Space)
 //!   - rust_find_lyric_index(...) -> O(log N) synced LRC line lookup
+//!   - rust_get_capslock_state() -> native CapsLock indicator
+//!   - rust_get_removable_drive_mask() -> native USB/removable drive detector
+//!   - rust_extract_file_icon_rgba(...) -> native Win32 SHGetFileInfoW + DrawIconEx icon extractor
+//!   - rust_poll_steam_download(...) -> native multi-library Steam live download scanner
+//!   - rust_eval_math_expr(...) -> safe recursive-descent calculator for Spotlight
 
 use std::f32::consts::PI;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::time::Instant;
 
 const N_FFT: usize = 2048;
 const N_BANDS: usize = 32;
@@ -95,6 +103,36 @@ struct DevModeW {
     dm_panning_height: u32,
 }
 
+#[repr(C)]
+struct ShFileInfoW {
+    h_icon: usize,
+    i_icon: i32,
+    dw_attributes: u32,
+    sz_display_name: [u16; 260],
+    sz_type_name: [u16; 80],
+}
+
+#[repr(C)]
+struct BitmapInfoHeader {
+    bi_size: u32,
+    bi_width: i32,
+    bi_height: i32,
+    bi_planes: u16,
+    bi_bit_count: u16,
+    bi_compression: u32,
+    bi_size_image: u32,
+    bi_x_pels_per_meter: i32,
+    bi_y_pels_per_meter: i32,
+    bi_clr_used: u32,
+    bi_clr_important: u32,
+}
+
+#[repr(C)]
+struct BitmapInfo {
+    bmi_header: BitmapInfoHeader,
+    bmi_colors: [u32; 1],
+}
+
 #[link(name = "user32")]
 extern "system" {
     fn GetForegroundWindow() -> usize;
@@ -108,12 +146,56 @@ extern "system" {
     fn EnumDisplaySettingsW(lpsz_device_name: *const u16, i_mode_num: u32, lp_dev_mode: *mut DevModeW) -> i32;
     fn GetClipboardSequenceNumber() -> u32;
     fn GetAsyncKeyState(v_key: i32) -> i16;
+    fn GetKeyState(v_key: i32) -> i16;
+    fn DestroyIcon(h_icon: usize) -> i32;
+    fn DrawIconEx(
+        hdc: usize,
+        x_left: i32,
+        y_top: i32,
+        h_icon: usize,
+        cx_width: i32,
+        cy_width: i32,
+        istep_if_ani_cur: u32,
+        hbr_flicker_free_draw: usize,
+        di_flags: u32,
+    ) -> i32;
+    fn GetDC(hwnd: usize) -> usize;
+    fn ReleaseDC(hwnd: usize, hdc: usize) -> i32;
 }
 
 #[link(name = "kernel32")]
 extern "system" {
     fn GetSystemTimes(idle: *mut FileTime, kernel: *mut FileTime, user: *mut FileTime) -> i32;
     fn GlobalMemoryStatusEx(lp_buffer: *mut MemoryStatusEx) -> i32;
+    fn GetLogicalDrives() -> u32;
+    fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+}
+
+#[link(name = "shell32")]
+extern "system" {
+    fn SHGetFileInfoW(
+        psz_path: *const u16,
+        dw_file_attributes: u32,
+        psfi: *mut ShFileInfoW,
+        cb_file_info: u32,
+        u_flags: u32,
+    ) -> usize;
+}
+
+#[link(name = "gdi32")]
+extern "system" {
+    fn CreateCompatibleDC(hdc: usize) -> usize;
+    fn DeleteDC(hdc: usize) -> i32;
+    fn SelectObject(hdc: usize, h_obj: usize) -> usize;
+    fn DeleteObject(h_obj: usize) -> i32;
+    fn CreateDIBSection(
+        hdc: usize,
+        pbmi: *const BitmapInfo,
+        usage: u32,
+        ppv_bits: *mut *mut u8,
+        h_section: usize,
+        offset: u32,
+    ) -> usize;
 }
 
 // -----------------------------------------------------------------------------
@@ -319,7 +401,7 @@ fn ft_to_u64(ft: FileTime) -> u64 {
 // -----------------------------------------------------------------------------
 #[no_mangle]
 pub extern "C" fn rust_core_version() -> u32 {
-    210
+    220
 }
 
 #[no_mangle]
@@ -585,6 +667,7 @@ static PREV_HOTKEY_MASK: AtomicU32 = AtomicU32::new(0);
 /// Edge-triggered Win32 global hotkey poller (zero system hook overhead):
 ///   bit 0 (1): Ctrl + Shift + I -> Summon / toggle Island with 2-Eyes reveal
 ///   bit 1 (2): Alt + M -> Instant audio mute toggle
+///   bit 2 (4): Alt + Space -> Open / close Island Spotlight Search
 #[no_mangle]
 pub extern "C" fn rust_poll_hotkeys() -> u32 {
     unsafe {
@@ -593,6 +676,7 @@ pub extern "C" fn rust_poll_hotkeys() -> u32 {
         let alt = (GetAsyncKeyState(0x12) as u16 & 0x8000) != 0;
         let key_i = (GetAsyncKeyState(0x49) as u16 & 0x8000) != 0; // 'I'
         let key_m = (GetAsyncKeyState(0x4D) as u16 & 0x8000) != 0; // 'M'
+        let key_sp = (GetAsyncKeyState(0x20) as u16 & 0x8000) != 0; // VK_SPACE
 
         let mut curr = 0u32;
         if ctrl && shift && key_i {
@@ -600,6 +684,9 @@ pub extern "C" fn rust_poll_hotkeys() -> u32 {
         }
         if alt && !ctrl && !shift && key_m {
             curr |= 2;
+        }
+        if alt && !ctrl && !shift && key_sp {
+            curr |= 4;
         }
         let prev = PREV_HOTKEY_MASK.swap(curr, Ordering::Relaxed);
         curr & !prev
@@ -632,4 +719,449 @@ pub unsafe extern "C" fn rust_find_lyric_index(
         }
     }
     lo as i32
+}
+
+/// Native Win32 CapsLock toggle state (1 = ON, 0 = OFF).
+#[no_mangle]
+pub extern "C" fn rust_get_capslock_state() -> i32 {
+    unsafe { (GetKeyState(0x14) & 1) as i32 }
+}
+
+/// Native Win32 bitmask of mounted USB / Removable drives (A..Z -> bits 0..25).
+#[no_mangle]
+pub extern "C" fn rust_get_removable_drive_mask() -> u32 {
+    unsafe {
+        let mask = GetLogicalDrives();
+        let mut out = 0u32;
+        for i in 0..26u32 {
+            if (mask & (1 << i)) != 0 {
+                let root: [u16; 4] = [(b'A' as u16) + (i as u16), b':' as u16, b'\\' as u16, 0];
+                // DRIVE_REMOVABLE = 2
+                if GetDriveTypeW(root.as_ptr()) == 2 {
+                    out |= 1 << i;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Extracts the real Windows high-res icon of any .exe / .lnk / file into RGBA8888 (size * size * 4 bytes).
+/// Uses SHGetFileInfoW + top-down 32-bit CreateDIBSection + DrawIconEx (handles full alpha cleanly).
+#[no_mangle]
+pub unsafe extern "C" fn rust_extract_file_icon_rgba(
+    path_utf16: *const u16,
+    out_rgba: *mut u8,
+    size: u32,
+) -> i32 {
+    if path_utf16.is_null() || out_rgba.is_null() || size < 16 || size > 128 {
+        return 0;
+    }
+    const SHGFI_ICON: u32 = 0x0000_0100;
+    const SHGFI_LARGEICON: u32 = 0x0000_0000;
+    const DI_NORMAL: u32 = 0x0003;
+
+    let mut sfi: ShFileInfoW = std::mem::zeroed();
+    let res = SHGetFileInfoW(
+        path_utf16,
+        0,
+        &mut sfi,
+        std::mem::size_of::<ShFileInfoW>() as u32,
+        SHGFI_ICON | SHGFI_LARGEICON,
+    );
+    if res == 0 || sfi.h_icon == 0 {
+        return 0;
+    }
+
+    let sz = size as i32;
+    let screen_dc = GetDC(0);
+    let mem_dc = CreateCompatibleDC(screen_dc);
+    if mem_dc == 0 {
+        ReleaseDC(0, screen_dc);
+        DestroyIcon(sfi.h_icon);
+        return 0;
+    }
+
+    let bmi = BitmapInfo {
+        bmi_header: BitmapInfoHeader {
+            bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+            bi_width: sz,
+            bi_height: -sz, // top-down DIB
+            bi_planes: 1,
+            bi_bit_count: 32,
+            bi_compression: 0, // BI_RGB
+            bi_size_image: 0,
+            bi_x_pels_per_meter: 0,
+            bi_y_pels_per_meter: 0,
+            bi_clr_used: 0,
+            bi_clr_important: 0,
+        },
+        bmi_colors: [0],
+    };
+
+    let mut bits_ptr: *mut u8 = std::ptr::null_mut();
+    let hbm = CreateDIBSection(mem_dc, &bmi, 0, &mut bits_ptr, 0, 0);
+    if hbm == 0 || bits_ptr.is_null() {
+        DeleteDC(mem_dc);
+        ReleaseDC(0, screen_dc);
+        DestroyIcon(sfi.h_icon);
+        return 0;
+    }
+
+    let n_bytes = (size as usize) * (size as usize) * 4;
+    std::ptr::write_bytes(bits_ptr, 0, n_bytes);
+    let old_obj = SelectObject(mem_dc, hbm);
+    let ok_draw = DrawIconEx(mem_dc, 0, 0, sfi.h_icon, sz, sz, 0, 0, DI_NORMAL);
+
+    let mut success = 0i32;
+    if ok_draw != 0 {
+        let src = std::slice::from_raw_parts(bits_ptr, n_bytes);
+        let dst = std::slice::from_raw_parts_mut(out_rgba, n_bytes);
+        let mut any_alpha = false;
+        let mut any_color = false;
+        for px in (0..n_bytes).step_by(4) {
+            let b = src[px];
+            let g = src[px + 1];
+            let r = src[px + 2];
+            let a = src[px + 3];
+            dst[px] = r;
+            dst[px + 1] = g;
+            dst[px + 2] = b;
+            dst[px + 3] = a;
+            if a > 0 {
+                any_alpha = true;
+            }
+            if r > 0 || g > 0 || b > 0 {
+                any_color = true;
+            }
+        }
+        // Handle legacy non-alpha icons where RGB was drawn with alpha=0
+        if !any_alpha && any_color {
+            for px in (0..n_bytes).step_by(4) {
+                if dst[px] > 0 || dst[px + 1] > 0 || dst[px + 2] > 0 {
+                    dst[px + 3] = 255;
+                }
+            }
+        }
+        if any_alpha || any_color {
+            success = 1;
+        }
+    }
+
+    SelectObject(mem_dc, old_obj);
+    DeleteObject(hbm);
+    DeleteDC(mem_dc);
+    ReleaseDC(0, screen_dc);
+    DestroyIcon(sfi.h_icon);
+    success
+}
+
+// -----------------------------------------------------------------------------
+// Native Multi-Library Steam Download Progress & Speed Scanner (Feature #11)
+// -----------------------------------------------------------------------------
+struct SteamDlTrack {
+    last_app: String,
+    last_bytes: u64,
+    last_time: Option<Instant>,
+    smooth_mbps: f32,
+}
+
+static STEAM_DL_STATE: Mutex<SteamDlTrack> = Mutex::new(SteamDlTrack {
+    last_app: String::new(),
+    last_bytes: 0,
+    last_time: None,
+    smooth_mbps: 0.0,
+});
+
+fn extract_vdf_field<'a>(content: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{}\"", key);
+    for line in content.lines() {
+        let tr = line.trim();
+        if let Some(rest) = tr.strip_prefix(&needle) {
+            let rest = rest.trim();
+            if let Some(after_q) = rest.strip_prefix('"') {
+                if let Some(end_q) = after_q.find('"') {
+                    return Some(&after_q[..end_q]);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn collect_steamapps_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let defaults = [
+        r"C:\Program Files (x86)\Steam\steamapps",
+        r"C:\Program Files\Steam\steamapps",
+        r"D:\Steam\steamapps",
+        r"D:\SteamLibrary\steamapps",
+        r"E:\SteamLibrary\steamapps",
+    ];
+    for d in &defaults {
+        let p = PathBuf::from(d);
+        if p.is_dir() && !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    }
+    // Parse libraryfolders.vdf to discover any custom Steam drives
+    let vdf_candidates = [
+        r"C:\Program Files (x86)\Steam\steamapps\libraryfolders.vdf",
+        r"C:\Program Files\Steam\steamapps\libraryfolders.vdf",
+    ];
+    for vdf_p in &vdf_candidates {
+        if let Ok(txt) = fs::read_to_string(vdf_p) {
+            for line in txt.lines() {
+                if let Some(raw_path) = extract_vdf_field(line, "path") {
+                    let clean = raw_path.replace("\\\\", "\\");
+                    let sa = Path::new(&clean).join("steamapps");
+                    if sa.is_dir() && !dirs.contains(&sa) {
+                        dirs.push(sa);
+                    }
+                }
+            }
+        }
+    }
+    dirs
+}
+
+/// Scans all Steam libraries for an actively downloading or updating game.
+/// Returns 1 if an active Steam download is found, 0 otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn rust_poll_steam_download(
+    out_name_utf8: *mut u8,
+    max_name_len: usize,
+    out_pct: *mut f32,
+    out_mbps: *mut f32,
+) -> i32 {
+    if out_name_utf8.is_null() || out_pct.is_null() || out_mbps.is_null() || max_name_len < 4 {
+        return 0;
+    }
+    let dirs = collect_steamapps_dirs();
+    let mut best: Option<(String, String, u64, u64)> = None;
+
+    for dir in dirs {
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let fname = entry.file_name();
+            let fstr = fname.to_string_lossy();
+            if !fstr.starts_with("appmanifest_") || !fstr.ends_with(".acf") {
+                continue;
+            }
+            let content = match fs::read_to_string(entry.path()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let flags: u32 = extract_vdf_field(&content, "StateFlags")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            // Steam StateFlags: 1024 = Downloading, 2048 = Preallocating, 512 = Staging, 2 = UpdateRequired
+            let is_active = (flags & (1024 | 512 | 2048)) != 0;
+            if !is_active {
+                continue;
+            }
+            let to_dl: u64 = extract_vdf_field(&content, "BytesToDownload")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let done_dl: u64 = extract_vdf_field(&content, "BytesDownloaded")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            if to_dl == 0 || done_dl >= to_dl {
+                continue;
+            }
+            let appid = extract_vdf_field(&content, "appid").unwrap_or("0").to_string();
+            let name = extract_vdf_field(&content, "name").unwrap_or("Steam").to_string();
+            best = Some((appid, name, done_dl, to_dl));
+            break;
+        }
+        if best.is_some() {
+            break;
+        }
+    }
+
+    if let Some((appid, name, done_dl, to_dl)) = best {
+        let pct = ((done_dl as f64 / (to_dl.max(1) as f64)) * 100.0).clamp(0.0, 99.9) as f32;
+        let mut mbps = 0.0f32;
+        if let Ok(mut st) = STEAM_DL_STATE.lock() {
+            let now = Instant::now();
+            if st.last_app == appid {
+                if let Some(prev_t) = st.last_time {
+                    let dt = now.duration_since(prev_t).as_secs_f32();
+                    if dt > 0.25 && done_dl >= st.last_bytes {
+                        let inst_mbps = ((done_dl - st.last_bytes) as f32) / (1_048_576.0 * dt);
+                        st.smooth_mbps = if st.smooth_mbps <= 0.01 {
+                            inst_mbps
+                        } else {
+                            st.smooth_mbps * 0.65 + inst_mbps * 0.35
+                        };
+                        st.last_bytes = done_dl;
+                        st.last_time = Some(now);
+                    }
+                }
+            } else {
+                st.last_app = appid;
+                st.last_bytes = done_dl;
+                st.last_time = Some(now);
+                st.smooth_mbps = 0.0;
+            }
+            mbps = st.smooth_mbps;
+        }
+        let nb = name.as_bytes();
+        let copy_n = nb.len().min(max_name_len - 1);
+        let out_slice = std::slice::from_raw_parts_mut(out_name_utf8, max_name_len);
+        out_slice[..copy_n].copy_from_slice(&nb[..copy_n]);
+        out_slice[copy_n] = 0;
+        *out_pct = pct;
+        *out_mbps = mbps;
+        return 1;
+    }
+    0
+}
+
+// -----------------------------------------------------------------------------
+// Safe Recursive-Descent Math Evaluator in Rust (Feature #2: Spotlight Calc)
+// -----------------------------------------------------------------------------
+struct ExprParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ExprParser<'a> {
+    fn skip_ws(&mut self) {
+        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_whitespace() {
+            self.pos += 1;
+        }
+    }
+    fn peek(&mut self) -> Option<u8> {
+        self.skip_ws();
+        self.bytes.get(self.pos).copied()
+    }
+    fn parse_expr(&mut self) -> Option<f64> {
+        let mut lhs = self.parse_term()?;
+        while let Some(c) = self.peek() {
+            match c {
+                b'+' => {
+                    self.pos += 1;
+                    lhs += self.parse_term()?;
+                }
+                b'-' => {
+                    self.pos += 1;
+                    lhs -= self.parse_term()?;
+                }
+                _ => break,
+            }
+        }
+        Some(lhs)
+    }
+    fn parse_term(&mut self) -> Option<f64> {
+        let mut lhs = self.parse_power()?;
+        while let Some(c) = self.peek() {
+            match c {
+                b'*' | b'x' | b'X' => {
+                    self.pos += 1;
+                    lhs *= self.parse_power()?;
+                }
+                b'/' => {
+                    self.pos += 1;
+                    let rhs = self.parse_power()?;
+                    if rhs.abs() < 1e-15 {
+                        return None;
+                    }
+                    lhs /= rhs;
+                }
+                b'%' => {
+                    self.pos += 1;
+                    let rhs = self.parse_power()?;
+                    if rhs.abs() < 1e-15 {
+                        return None;
+                    }
+                    lhs %= rhs;
+                }
+                _ => break,
+            }
+        }
+        Some(lhs)
+    }
+    fn parse_power(&mut self) -> Option<f64> {
+        let base = self.parse_unary()?;
+        if self.peek() == Some(b'^') {
+            self.pos += 1;
+            let exp = self.parse_unary()?;
+            return Some(base.powf(exp));
+        }
+        Some(base)
+    }
+    fn parse_unary(&mut self) -> Option<f64> {
+        match self.peek() {
+            Some(b'-') => {
+                self.pos += 1;
+                Some(-self.parse_unary()?)
+            }
+            Some(b'+') => {
+                self.pos += 1;
+                self.parse_unary()
+            }
+            _ => self.parse_primary(),
+        }
+    }
+    fn parse_primary(&mut self) -> Option<f64> {
+        if self.peek() == Some(b'(') {
+            self.pos += 1;
+            let v = self.parse_expr()?;
+            if self.peek() != Some(b')') {
+                return None;
+            }
+            self.pos += 1;
+            return Some(v);
+        }
+        self.skip_ws();
+        let start = self.pos;
+        let mut has_dot = false;
+        while self.pos < self.bytes.len() {
+            let b = self.bytes[self.pos];
+            if b.is_ascii_digit() {
+                self.pos += 1;
+            } else if (b == b'.' || b == b',') && !has_dot {
+                has_dot = true;
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        if self.pos > start {
+            let s = std::str::from_utf8(&self.bytes[start..self.pos]).ok()?.replace(',', ".");
+            return s.parse::<f64>().ok();
+        }
+        None
+    }
+}
+
+/// Evaluates an arithmetic expression safely in Rust (returns 1 on valid math result, 0 otherwise).
+#[no_mangle]
+pub unsafe extern "C" fn rust_eval_math_expr(
+    expr_utf8: *const u8,
+    expr_len: usize,
+    out_val: *mut f64,
+) -> i32 {
+    if expr_utf8.is_null() || out_val.is_null() || expr_len == 0 || expr_len > 256 {
+        return 0;
+    }
+    let slice = std::slice::from_raw_parts(expr_utf8, expr_len);
+    // Must contain at least one operator so plain numbers like "2026" don't hijack app search
+    let has_op = slice.iter().any(|&b| matches!(b, b'+' | b'-' | b'*' | b'/' | b'^' | b'%' | b'('));
+    if !has_op {
+        return 0;
+    }
+    let mut parser = ExprParser { bytes: slice, pos: 0 };
+    if let Some(val) = parser.parse_expr() {
+        parser.skip_ws();
+        if parser.pos == slice.len() && val.is_finite() {
+            *out_val = val;
+            return 1;
+        }
+    }
+    0
 }
