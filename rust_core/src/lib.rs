@@ -134,9 +134,30 @@ struct BitmapInfo {
     bmi_colors: [u32; 1],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SystemPowerStatus {
+    ac_line_status: u8,
+    battery_flag: u8,
+    battery_life_percent: u8,
+    system_status_flag: u8,
+    battery_life_time: u32,
+    battery_full_life_time: u32,
+}
+
 #[link(name = "user32")]
 extern "system" {
     fn GetForegroundWindow() -> usize;
+    fn GetWindowThreadProcessId(hwnd: usize, lpdw_process_id: *mut u32) -> u32;
+    fn GetKeyboardLayout(id_thread: u32) -> usize;
+    fn GetCursorPos(lp_point: *mut Point) -> i32;
     fn IsWindowVisible(hwnd: usize) -> i32;
     fn IsIconic(hwnd: usize) -> i32;
     fn GetWindowRect(hwnd: usize, lp_rect: *mut Rect) -> i32;
@@ -170,6 +191,7 @@ extern "system" {
     fn GlobalMemoryStatusEx(lp_buffer: *mut MemoryStatusEx) -> i32;
     fn GetLogicalDrives() -> u32;
     fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+    fn GetSystemPowerStatus(lp_system_power_status: *mut SystemPowerStatus) -> i32;
 }
 
 #[link(name = "shell32")]
@@ -209,6 +231,7 @@ extern "system" {
     fn DeleteDC(hdc: usize) -> i32;
     fn SelectObject(hdc: usize, h_obj: usize) -> usize;
     fn DeleteObject(h_obj: usize) -> i32;
+    fn GetPixel(hdc: usize, x: i32, y: i32) -> u32;
     fn CreateDIBSection(
         hdc: usize,
         pbmi: *const BitmapInfo,
@@ -422,7 +445,7 @@ fn ft_to_u64(ft: FileTime) -> u64 {
 // -----------------------------------------------------------------------------
 #[no_mangle]
 pub extern "C" fn rust_core_version() -> u32 {
-    230
+    231
 }
 
 #[no_mangle]
@@ -1375,4 +1398,101 @@ pub unsafe extern "C" fn rust_eval_math_expr(
         }
     }
     0
+}
+
+/// Native Win32 primary keyboard layout LangID of foreground window (0x19=RU, 0x09=EN, 0x22=UA, 0x07=DE).
+#[no_mangle]
+pub extern "C" fn rust_get_keyboard_layout() -> u32 {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg == 0 {
+            return 0x09;
+        }
+        let tid = GetWindowThreadProcessId(fg, std::ptr::null_mut());
+        let klid = GetKeyboardLayout(tid);
+        ((klid & 0xFFFF) & 0x3FF) as u32
+    }
+}
+
+/// Native Win32 pixel color pipette under current cursor position.
+#[no_mangle]
+pub unsafe extern "C" fn rust_get_cursor_pixel_rgb(
+    out_r: *mut u8,
+    out_g: *mut u8,
+    out_b: *mut u8,
+) -> i32 {
+    if out_r.is_null() || out_g.is_null() || out_b.is_null() {
+        return 0;
+    }
+    let mut pt = Point::default();
+    if GetCursorPos(&mut pt) == 0 {
+        return 0;
+    }
+    let hdc = GetDC(0);
+    if hdc == 0 {
+        return 0;
+    }
+    let col = GetPixel(hdc, pt.x, pt.y);
+    ReleaseDC(0, hdc);
+    if col == 0xFFFF_FFFF {
+        return 0;
+    }
+    *out_r = (col & 0xFF) as u8;
+    *out_g = ((col >> 8) & 0xFF) as u8;
+    *out_b = ((col >> 16) & 0xFF) as u8;
+    1
+}
+
+/// Native Win32 battery / AC power status (replaces psutil.sensors_battery).
+/// Returns 1 if battery present (pct in 0..=100), 0 if desktop PC (no battery).
+#[no_mangle]
+pub unsafe extern "C" fn rust_get_power_status(out_pct: *mut i32, out_ac: *mut i32) -> i32 {
+    if out_pct.is_null() || out_ac.is_null() {
+        return 0;
+    }
+    let mut st = SystemPowerStatus::default();
+    if GetSystemPowerStatus(&mut st) == 0 {
+        return 0;
+    }
+    *out_ac = if st.ac_line_status == 1 { 1 } else { 0 };
+    if st.battery_flag == 128 || st.battery_life_percent > 100 {
+        *out_pct = -1;
+        return 0;
+    }
+    *out_pct = st.battery_life_percent as i32;
+    1
+}
+
+/// Reads Windows AppsUseLightTheme from HKCU directly in Rust (1 = Dark, 0 = Light).
+#[no_mangle]
+pub extern "C" fn rust_get_dark_theme() -> i32 {
+    unsafe {
+        const HKEY_CURRENT_USER: isize = -2147483647;
+        const KEY_READ: u32 = 0x20019;
+        let subkey: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
+            .encode_utf16()
+            .collect();
+        let val_name: Vec<u16> = "AppsUseLightTheme\0".encode_utf16().collect();
+        let mut hkey: usize = 0;
+        if RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
+            return 1;
+        }
+        let mut val: u32 = 0;
+        let mut cb: u32 = 4;
+        let mut rtype: u32 = 0;
+        let ok = RegQueryValueExW(
+            hkey,
+            val_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut rtype,
+            (&mut val as *mut u32) as *mut u8,
+            &mut cb,
+        );
+        RegCloseKey(hkey);
+        if ok == 0 {
+            if val == 0 { 1 } else { 0 }
+        } else {
+            1
+        }
+    }
 }
