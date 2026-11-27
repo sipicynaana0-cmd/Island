@@ -43,6 +43,8 @@ class RustCoreBridge:
         self.core_version: int = 0
         self._has_v21 = False
         self._has_v22 = False
+        self._has_v231 = False
+        self.last_active_springs: int = 1
         self._fft_bands_buf = (ctypes.c_float * 32)()
         self._fft_lvl_buf = ctypes.c_float(0.0)
         self._wave_bands_buf = (ctypes.c_float * 32)()
@@ -170,11 +172,30 @@ class RustCoreBridge:
                         self._has_v22 = True
                     except Exception:
                         self._has_v22 = False
+                if ver >= 231:
+                    try:
+                        dll.rust_get_keyboard_layout.restype = ctypes.c_uint32
+                        dll.rust_get_cursor_pixel_rgb.argtypes = [
+                            ctypes.POINTER(ctypes.c_uint8),
+                            ctypes.POINTER(ctypes.c_uint8),
+                            ctypes.POINTER(ctypes.c_uint8),
+                        ]
+                        dll.rust_get_cursor_pixel_rgb.restype = ctypes.c_int32
+                        dll.rust_get_power_status.argtypes = [
+                            ctypes.POINTER(ctypes.c_int32),
+                            ctypes.POINTER(ctypes.c_int32),
+                        ]
+                        dll.rust_get_power_status.restype = ctypes.c_int32
+                        dll.rust_get_dark_theme.restype = ctypes.c_int32
+                        self._has_v231 = True
+                    except Exception:
+                        self._has_v231 = False
         except Exception:
             self._dll = None
             self.is_loaded = False
             self._has_v21 = False
             self._has_v22 = False
+            self._has_v231 = False
 
     def fft_32bands(self, np_f32_arr, sr: float) -> Optional[Tuple[List[float], float]]:
         if not self.is_loaded or self._dll is None:
@@ -280,7 +301,7 @@ class RustCoreBridge:
                 tgts[i] = sp.target
                 stfs[i] = sp.stiffness
                 dmps[i] = sp.damping
-            self._dll.rust_step_springs(vals, vels, tgts, stfs, dmps, n, ctypes.c_float(dt))
+            self.last_active_springs = int(self._dll.rust_step_springs(vals, vels, tgts, stfs, dmps, n, ctypes.c_float(dt)))
             for i, sp in enumerate(springs):
                 sp.value = vals[i]
                 sp.velocity = vels[i]
@@ -404,17 +425,64 @@ class RustCoreBridge:
                 pass
         return None
 
+    def version_label(self) -> str:
+        v = self.core_version
+        if v <= 0:
+            return "—"
+        return f"{v // 100}.{(v // 10) % 10}.{v % 10}"
+
+    def get_keyboard_layout_id(self) -> Optional[int]:
+        if self._has_v231 and self._dll is not None:
+            try:
+                return int(self._dll.rust_get_keyboard_layout())
+            except Exception:
+                pass
+        return None
+
+    def get_cursor_pixel_rgb(self) -> Optional[Tuple[int, int, int]]:
+        if self._has_v231 and self._dll is not None:
+            try:
+                r = ctypes.c_uint8(0)
+                g = ctypes.c_uint8(0)
+                b = ctypes.c_uint8(0)
+                if self._dll.rust_get_cursor_pixel_rgb(ctypes.byref(r), ctypes.byref(g), ctypes.byref(b)):
+                    return int(r.value), int(g.value), int(b.value)
+            except Exception:
+                pass
+        return None
+
+    def get_power_status(self) -> Optional[Tuple[Optional[int], bool]]:
+        if self._has_v231 and self._dll is not None:
+            try:
+                pct = ctypes.c_int32(-1)
+                ac = ctypes.c_int32(1)
+                has_bat = self._dll.rust_get_power_status(ctypes.byref(pct), ctypes.byref(ac))
+                return (int(pct.value) if has_bat else None), bool(ac.value)
+            except Exception:
+                pass
+        return None
+
+    def get_dark_theme(self) -> Optional[bool]:
+        if self._has_v231 and self._dll is not None:
+            try:
+                return bool(self._dll.rust_get_dark_theme())
+            except Exception:
+                pass
+        return None
+
 
 RUST_CORE = RustCoreBridge()
 
 
 def get_active_keyboard_layout() -> str:
-    """Returns 'RU', 'EN', etc. of the active foreground window (< 5 microseconds)."""
+    """Returns 'RU', 'EN', etc. of the active foreground window (via native Rust Win32)."""
     try:
-        hwnd = user32.GetForegroundWindow()
-        thread_id = user32.GetWindowThreadProcessId(hwnd, None)
-        klid = user32.GetKeyboardLayout(thread_id)
-        primary = (klid & 0xFFFF) & 0x3FF
+        primary = RUST_CORE.get_keyboard_layout_id()
+        if primary is None:
+            hwnd = user32.GetForegroundWindow()
+            thread_id = user32.GetWindowThreadProcessId(hwnd, None)
+            klid = user32.GetKeyboardLayout(thread_id)
+            primary = (klid & 0xFFFF) & 0x3FF
         if primary == 0x19:
             return "RU"
         elif primary == 0x09:
@@ -1769,10 +1837,18 @@ class SystemTelemetry:
                     self._last_net_sent = net.bytes_sent
                     self._last_net_time = now
 
-                    bat = psutil.sensors_battery()
-                    if bat is not None:
-                        self.battery_percent = int(round(bat.percent))
-                        self.battery_charging = bool(bat.power_plugged)
+                    pwr = RUST_CORE.get_power_status()
+                    if pwr is not None:
+                        self.battery_percent, self.battery_charging = pwr
+                    else:
+                        bat = psutil.sensors_battery()
+                        if bat is not None:
+                            self.battery_percent = int(round(bat.percent))
+                            self.battery_charging = bool(bat.power_plugged)
+
+                    dt_rust = RUST_CORE.get_dark_theme()
+                    if dt_rust is not None:
+                        self.is_dark_theme = dt_rust
 
                     self._check_privacy_sensors()
                 if tick % 4 == 0:
@@ -1865,6 +1941,10 @@ def sleep_workstation():
 
 
 def get_cursor_pixel_hex() -> Tuple[str, Tuple[int, int, int]]:
+    rgb = RUST_CORE.get_cursor_pixel_rgb()
+    if rgb is not None:
+        r, g, b = rgb
+        return f"#{r:02X}{g:02X}{b:02X}", (r, g, b)
     try:
         pt = wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(pt))
