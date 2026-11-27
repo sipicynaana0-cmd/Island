@@ -8,6 +8,7 @@ import time
 from typing import Callable, Dict, List, Optional, Tuple
 
 from PyQt6.QtCore import (
+    QEvent,
     QMimeData,
     QPointF,
     QRect,
@@ -1287,12 +1288,13 @@ class DynamicIslandWidget(QWidget):
         self._dragging_bright_slider = False
         self._dragging_app_slider: Optional[str] = None
 
-        # Auto-adaptive native monitor refresh rate loop via Rust Core (60..240 Hz!)
+        # Auto-adaptive native monitor refresh rate + eco-idle frame pacing via Rust Core (60..240 Hz!)
         self._display_hz: int = RUST_CORE.get_refresh_rate_hz()
-        frame_ms = max(4, min(16, int(round(1000.0 / max(60, self._display_hz)))))
+        self._active_frame_ms: int = max(4, min(16, int(round(1000.0 / max(60, self._display_hz)))))
+        self._eco_frame_ms: int = 50  # 20 FPS eco-idle cuts background CPU/GPU by ~70%
         self._last_frame_time = time.monotonic()
         self._anim_timer = QTimer(self)
-        self._anim_timer.setInterval(frame_ms)
+        self._anim_timer.setInterval(self._active_frame_ms)
         self._anim_timer.timeout.connect(self._on_anim_frame)
 
         # Fast 30ms watcher
@@ -1394,6 +1396,11 @@ class DynamicIslandWidget(QWidget):
                 self.update()
                 return True
         return super().eventFilter(obj, event)
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.ActivationChange and self.spotlight_open and not self.isActiveWindow():
+            self._close_spotlight()
+        super().changeEvent(event)
 
     def _reposition_canvas(self):
         screen = QGuiApplication.primaryScreen()
@@ -1506,6 +1513,8 @@ class DynamicIslandWidget(QWidget):
         self._ensure_anim_running()
 
     def _ensure_anim_running(self):
+        if self._anim_timer.interval() != self._active_frame_ms:
+            self._anim_timer.setInterval(self._active_frame_ms)
         if not self._anim_timer.isActive():
             self._last_frame_time = time.monotonic()
             self._anim_timer.start()
@@ -1970,6 +1979,23 @@ class DynamicIslandWidget(QWidget):
 
         if self.sp_expand.value > 0.3:
             self._app_sessions = self.audio.get_app_sessions(trigger_poll=self.show_inline_mixer)
+
+        # Smart Adaptive Frame Pacing: full native monitor Hz when active, 20 FPS eco-idle when completely calm!
+        is_busy = (
+            RUST_CORE.last_active_springs > 0
+            or track.is_playing
+            or self.sp_expand.value > 0.02
+            or self.game_hide_state == "revealing"
+            or self.spotlight_open
+            or self.is_updating_collapse
+            or self._active_download is not None
+            or now < self._osd_until
+            or bool(self._ripples)
+            or now < self._eye_happy_until
+        )
+        want_ms = self._active_frame_ms if is_busy else self._eco_frame_ms
+        if self._anim_timer.interval() != want_ms:
+            self._anim_timer.setInterval(want_ms)
 
         self.update()
 
@@ -2788,7 +2814,16 @@ class DynamicIslandWidget(QWidget):
             p.drawPath(island_path)
 
         wave_mode = self.consent_mgr.wave_style_mode
-        if wave_mode != 2 and not bottom_wave_path.isEmpty():
+        show_music_wave = (
+            wave_mode != 2
+            and track.is_playing
+            and not self.spotlight_open
+            and self._active_download is None
+            and not self.is_updating_collapse
+            and osd_t < 0.2
+            and not bottom_wave_path.isEmpty()
+        )
+        if show_music_wave:
             wave_grad = QLinearGradient(QPointF(cap.left() + br, cap.bottom()), QPointF(cap.right() - br, cap.bottom()))
             wave_grad.setColorAt(0.0, QColor(r1, g1, b1, 0))
             wave_grad.setColorAt(0.14, QColor(r1, g1, b1, 225 if wave_mode == 0 else 145))
@@ -2806,6 +2841,11 @@ class DynamicIslandWidget(QWidget):
             p.setPen(QPen(QBrush(wave_grad), 1.75 if wave_mode == 0 else 1.25, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawPath(bottom_wave_path)
+        elif self.sp_top_y.value <= 1.5 and self.game_hide_state == "visible":
+            # Crisp razor-subtle monochrome hairline contour when music is paused/idle/downloading/Spotlight
+            p.setPen(QPen(QColor(255, 255, 255, 22), 0.9))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(island_path)
 
     def _paint_privacy_dots(self, p: QPainter, right_x: float, cy: float) -> float:
         """Draws iOS-style Orange (Microphone) and Green (Camera) privacy indicator dots (Item 2)."""
@@ -5244,7 +5284,7 @@ class DynamicIslandWidget(QWidget):
             f"Доступно обновление {self.updater.remote_version}" if has_upd else "Установлена последняя версия",
         )
 
-        rust_lbl = f"Rust Core 2.3 · {self._display_hz} Гц" if RUST_CORE.is_loaded else f"Python · {self._display_hz} Гц"
+        rust_lbl = f"Rust Core {RUST_CORE.version_label()} · {self._display_hz} Гц" if RUST_CORE.is_loaded else f"Python · {self._display_hz} Гц"
         p.setPen(QColor(92, 92, 102, 230))
         p.setFont(QFont("Segoe UI", 8))
         p.drawText(
